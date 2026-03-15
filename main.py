@@ -1,4 +1,7 @@
+import json
 import os
+import time
+from collections import OrderedDict
 from typing import Optional
 
 import httpx
@@ -24,6 +27,9 @@ app.add_middleware(
 GOOGLE_BOOKS_API = "https://www.googleapis.com/books/v1/volumes"
 OPEN_LIBRARY_SEARCH_API = "https://openlibrary.org/search.json"
 API_KEY = os.getenv("GOOGLE_BOOKS_API_KEY")
+CACHE_TTL_SECONDS = int(os.getenv("BOOKIT_CACHE_TTL_SECONDS", "21600"))
+CACHE_MAX_ITEMS = int(os.getenv("BOOKIT_CACHE_MAX_ITEMS", "512"))
+GOOGLE_COOLDOWN_SECONDS = int(os.getenv("BOOKIT_GOOGLE_COOLDOWN_SECONDS", "900"))
 GENERIC_SUBJECTS = {
     "fiction",
     "ficcao",
@@ -35,6 +41,58 @@ GENERIC_SUBJECTS = {
 }
 
 
+class GoogleBooksUnavailable(Exception):
+    pass
+
+
+_google_unavailable_until = 0.0
+_CACHE: "OrderedDict[str, tuple[float, object]]" = OrderedDict()
+
+
+def _cache_get(key: str):
+    if CACHE_TTL_SECONDS <= 0:
+        return None
+
+    entry = _CACHE.get(key)
+    if not entry:
+        return None
+
+    timestamp, value = entry
+    if time.time() - timestamp > CACHE_TTL_SECONDS:
+        _CACHE.pop(key, None)
+        return None
+
+    _CACHE.move_to_end(key)
+    return value
+
+
+def _cache_set(key: str, value: object) -> None:
+    if CACHE_TTL_SECONDS <= 0:
+        return
+
+    _CACHE[key] = (time.time(), value)
+    _CACHE.move_to_end(key)
+
+    if CACHE_MAX_ITEMS <= 0:
+        return
+
+    while len(_CACHE) > CACHE_MAX_ITEMS:
+        _CACHE.popitem(last=False)
+
+
+def _cache_key(prefix: str, params: dict) -> str:
+    return f"{prefix}:{json.dumps(params, sort_keys=True, separators=(',', ':'))}"
+
+
+def _google_books_available() -> bool:
+    return time.time() >= _google_unavailable_until
+
+
+def _mark_google_unavailable() -> None:
+    global _google_unavailable_until
+    _google_unavailable_until = time.time() + GOOGLE_COOLDOWN_SECONDS
+
+
 def normalize_text(value: Optional[str]) -> str:
     return value.casefold().strip() if value else ""
 
@@ -44,6 +102,9 @@ def has_text(value: Optional[str]) -> bool:
 
 
 async def fetch_google_books(query: str, max_results: int = 20) -> list[dict]:
+    if not _google_books_available():
+        raise GoogleBooksUnavailable("Google Books temporariamente indisponivel")
+
     params = {
         "q": query,
         "maxResults": max_results,
@@ -52,14 +113,94 @@ async def fetch_google_books(query: str, max_results: int = 20) -> list[dict]:
     if API_KEY:
         params["key"] = API_KEY
 
+    cache_key = _cache_key("google_books", {"q": query, "max": max_results, "keyed": bool(API_KEY)})
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     async with httpx.AsyncClient(timeout=10.0) as client:
         response = await client.get(GOOGLE_BOOKS_API, params=params)
+
+    if response.status_code in (403, 429):
+        _mark_google_unavailable()
+        raise GoogleBooksUnavailable("Google Books quota excedida")
 
     if response.status_code != 200:
         raise HTTPException(status_code=502, detail="Falha ao contatar Google Books API")
 
     data = response.json()
-    return data.get("items", [])
+    items = data.get("items", [])
+    _cache_set(cache_key, items)
+    return items
+
+
+async def fetch_open_library_search(params: dict) -> list[dict]:
+    cache_key = _cache_key("open_library_search", params)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    headers = {"User-Agent": "BookRecomendations/0.1 (Open Library search)"}
+    async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
+        response = await client.get(OPEN_LIBRARY_SEARCH_API, params=params)
+        response.raise_for_status()
+
+    docs = response.json().get("docs", [])
+    _cache_set(cache_key, docs)
+    return docs
+
+
+def parse_open_library_doc(doc: dict) -> Optional[BookResponse]:
+    try:
+        cover_id = doc.get("cover_i")
+        thumbnail = f"https://covers.openlibrary.org/b/id/{cover_id}-M.jpg" if cover_id else None
+        subjects = doc.get("subject", []) or []
+        language = ""
+        if isinstance(doc.get("language"), list) and doc["language"]:
+            language = doc["language"][0]
+
+        return BookResponse(
+            id=doc.get("key", ""),
+            title=doc.get("title", "Sem titulo"),
+            authors=doc.get("author_name", []) or [],
+            categories=subjects[:3],
+            page_count=doc.get("number_of_pages_median"),
+            published_year=doc.get("first_publish_year"),
+            description="",
+            thumbnail=thumbnail,
+            language=language,
+        )
+    except Exception:
+        return None
+
+
+async def fetch_open_library_books_by_author(
+    author: str,
+    title: Optional[str] = None,
+    max_results: int = 20,
+) -> list[BookResponse]:
+    params = {
+        "author": author.strip(),
+        "limit": max_results,
+        "fields": "key,title,author_name,first_publish_year,cover_i,subject,language,number_of_pages_median",
+    }
+    if has_text(title):
+        params["title"] = title.strip()
+
+    docs = await fetch_open_library_search(params)
+    books = [parse_open_library_doc(doc) for doc in docs]
+    return [book for book in books if book is not None]
+
+
+async def fetch_open_library_books_by_query(query: str, max_results: int = 20) -> list[BookResponse]:
+    params = {
+        "q": query.strip(),
+        "limit": max_results,
+        "fields": "key,title,author_name,first_publish_year,cover_i,subject,language,number_of_pages_median",
+    }
+    docs = await fetch_open_library_search(params)
+    books = [parse_open_library_doc(doc) for doc in docs]
+    return [book for book in books if book is not None]
 
 
 async def fetch_books_by_author(author: str, title: Optional[str] = None, max_results: int = 20) -> list[BookResponse]:
@@ -88,20 +229,25 @@ async def fetch_open_library_subjects(
     headers = {"User-Agent": "BookRecomendations/0.1 (Open Library enrichment)"}
 
     try:
-        async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
-            search_response = await client.get(OPEN_LIBRARY_SEARCH_API, params=params)
-            search_response.raise_for_status()
-            docs = search_response.json().get("docs", [])
-            work_key = choose_open_library_work(docs, title, authors, published_year)
-            if not work_key:
-                return []
+        docs = await fetch_open_library_search(params)
+        work_key = choose_open_library_work(docs, title, authors, published_year)
+        if not work_key:
+            return []
 
+        work_cache_key = _cache_key("open_library_work", {"key": work_key})
+        cached = _cache_get(work_cache_key)
+        if cached is not None:
+            return select_specific_subjects(cached.get("subjects", []))
+
+        async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
             work_response = await client.get(f"https://openlibrary.org{work_key}.json")
             work_response.raise_for_status()
+            work_data = work_response.json()
+            _cache_set(work_cache_key, work_data)
     except httpx.HTTPError:
         return []
 
-    return select_specific_subjects(work_response.json().get("subjects", []))
+    return select_specific_subjects(work_data.get("subjects", []))
 
 
 def choose_open_library_work(
@@ -211,6 +357,24 @@ async def fetch_candidate_books(search_terms: list[str], max_results: int = 40) 
     return candidates
 
 
+async def fetch_open_library_candidates(search_terms: list[str], max_results: int = 40) -> list[BookResponse]:
+    candidates: list[BookResponse] = []
+    seen_ids: set[str] = set()
+    per_term_limit = max(10, max_results // max(1, len(search_terms)))
+
+    for term in search_terms:
+        books = await fetch_open_library_books_by_query(term.strip(), max_results=per_term_limit)
+        for book in books:
+            if not book or book.id in seen_ids:
+                continue
+            seen_ids.add(book.id)
+            candidates.append(book)
+            if len(candidates) >= max_results:
+                return candidates
+
+    return candidates
+
+
 def dedupe_books(books: list[BookResponse]) -> list[BookResponse]:
     deduped = []
     seen_ids: set[str] = set()
@@ -254,9 +418,13 @@ async def search_books(
     q: str = Query(..., description="Titulo ou termo de busca"),
     max_results: int = Query(10, ge=1, le=40),
 ):
-    items = await fetch_google_books(q, max_results)
-    books = [parse_book(item) for item in items]
-    return [book for book in books if book is not None]
+    try:
+        items = await fetch_google_books(q, max_results)
+        books = [parse_book(item) for item in items]
+        return [book for book in books if book is not None]
+    except GoogleBooksUnavailable:
+        books = await fetch_open_library_books_by_query(q, max_results=max_results)
+        return books
 
 
 @app.get("/recommend", response_model=RecommendationResponse)
@@ -276,18 +444,29 @@ async def recommend_books(
             detail="Informe pelo menos um titulo ou autor para recomendar livros",
         )
 
+    google_available = True
     author_books: list[BookResponse] = []
     if has_text(author):
-        author_books = await fetch_books_by_author(author.strip(), q, max_results=20)
+        try:
+            author_books = await fetch_books_by_author(author.strip(), q, max_results=20)
+        except GoogleBooksUnavailable:
+            google_available = False
+            author_books = await fetch_open_library_books_by_author(author.strip(), q, max_results=20)
 
     reference: Optional[BookResponse] = author_books[0] if author_books else None
 
     if reference is None and has_text(q):
-        reference_items = await fetch_google_books(q.strip(), max_results=5)
-        if not reference_items:
-            raise HTTPException(status_code=404, detail="Livro de referencia nao encontrado")
+        if google_available:
+            try:
+                reference_items = await fetch_google_books(q.strip(), max_results=5)
+                if reference_items:
+                    reference = parse_book(reference_items[0])
+            except GoogleBooksUnavailable:
+                google_available = False
 
-        reference = parse_book(reference_items[0])
+        if reference is None:
+            reference_candidates = await fetch_open_library_books_by_query(q.strip(), max_results=5)
+            reference = reference_candidates[0] if reference_candidates else None
 
     if not reference:
         raise HTTPException(
@@ -304,7 +483,14 @@ async def recommend_books(
         reference.categories = list(dict.fromkeys(reference.categories + enriched_subjects))
 
     search_terms = build_search_terms(q, reference, category, enriched_subjects)
-    thematic_candidates = await fetch_candidate_books(search_terms, max_results=40)
+    if google_available:
+        try:
+            thematic_candidates = await fetch_candidate_books(search_terms, max_results=40)
+        except GoogleBooksUnavailable:
+            google_available = False
+            thematic_candidates = await fetch_open_library_candidates(search_terms, max_results=40)
+    else:
+        thematic_candidates = await fetch_open_library_candidates(search_terms, max_results=40)
     candidates = dedupe_books(author_books + thematic_candidates)
 
     filters = {

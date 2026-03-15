@@ -1,7 +1,9 @@
+import os
+
 import httpx
 import streamlit as st
 
-BASE_URL = "http://localhost:8000"
+BASE_URL = os.getenv("BOOKIT_BASE_URL", "http://localhost:8000")
 COMMON_GENRES = [
     "",
     "Fiction",
@@ -216,16 +218,17 @@ def get_recommendations(title: str, author: str, filters: dict) -> dict | None:
 
     return response.json()
 
+st.title("Book-it")
 
 def render_intro() -> None:
     st.markdown(
         """
         <div class="hero-block">
-            <div class="hero-kicker">Recomendações literarias</div>
+            <div class="hero-kicker">Recomendações literárias</div>
             <div class="hero-title">Encontre sua próxima leitura a partir de livros e autores favoritos.</div>
             <div class="hero-copy">
                 Pesquise por título, por autor, ou pelos dois ao mesmo tempo. Quando um autor é informado,
-                as obras dele ganham prioridade antes da exploracao por autores similares.
+                as obras dele ganham prioridade antes da exploração por autores similares.
             </div>
         </div>
         """,
@@ -237,7 +240,7 @@ def render_intro() -> None:
         <div class="chip-grid">
             <div class="chip-card">
                 <strong>Busca guiada</strong>
-                <span>Parta de um titulo ou autor conhecido para explorar livros relacionados.</span>
+                <span>Parta de um título ou autor conhecido para explorar livros relacionados.</span>
             </div>
             <div class="chip-card">
                 <strong>Autor em foco</strong>
@@ -245,11 +248,11 @@ def render_intro() -> None:
             </div>
             <div class="chip-card">
                 <strong>Filtros intuitivos</strong>
-                <span>Paginas e ano aceitam digitacao manual e setas em passos de 10.</span>
+                <span>Páginas e ano aceitam digitação manual e setas em passos de 10.</span>
             </div>
             <div class="chip-card">
-                <strong>Genero flexivel</strong>
-                <span>Escolha um genero sugerido ou digite o termo que quiser.</span>
+                <strong>Gênero flexível</strong>
+                <span>Escolha um gênero sugerido ou digite o termo que quiser.</span>
             </div>
         </div>
         """,
@@ -271,25 +274,25 @@ def render_section_header(kicker: str, title: str, copy: str) -> None:
 
 
 def build_filters() -> dict:
-    with st.expander("Filtros de recomendacao", expanded=True):
-        st.caption("Use 0 para ignorar filtros numericos.")
+    with st.expander("Filtros de recomendação", expanded=True):
+        st.caption("Use 0 para ignorar filtros numéricos.")
 
         top_left, top_right = st.columns([1.6, 1], gap="large")
         with top_left:
             selected_genre = st.selectbox(
-                "Genero literario",
+                "Gênero literário",
                 options=COMMON_GENRES,
                 index=0,
-                help="Voce pode digitar para localizar opcoes dentro do dropdown.",
+                help="Você pode digitar para localizar opções dentro do dropdown.",
             )
             custom_genre = st.text_input(
-                "Ou digite um genero",
+                "Ou digite um gênero",
                 placeholder="Ex.: fantasia sombria, romance, filosofia",
-                help="Se preenchido, este texto tem prioridade sobre o genero sugerido.",
+                help="Se preenchido, este texto tem prioridade sobre o gênero sugerido.",
             )
         with top_right:
             limit = st.number_input(
-                "Quantidade de recomendacoes",
+                "Quantidade de recomendações",
                 min_value=1,
                 max_value=20,
                 value=5,
@@ -299,33 +302,33 @@ def build_filters() -> dict:
         col1, col2 = st.columns(2, gap="large")
         with col1:
             min_pages = st.number_input(
-                "Paginas minimas",
+                "Páginas mínimas",
                 min_value=0,
                 value=0,
                 step=10,
-                help="Aceita digitacao manual ou incrementos de 10 paginas.",
+                help="Aceita digitação manual ou incrementos de 10 páginas.",
             )
             min_year = st.number_input(
-                "Ano minimo",
+                "Ano mínimo",
                 min_value=0,
                 value=0,
                 step=10,
-                help="Aceita digitacao manual ou incrementos de 10 anos.",
+                help="Aceita digitação manual ou incrementos de 10 anos.",
             )
         with col2:
             max_pages = st.number_input(
-                "Paginas maximas",
+                "Páginas máximas",
                 min_value=0,
                 value=0,
                 step=10,
-                help="Aceita digitacao manual ou incrementos de 10 paginas.",
+                help="Aceita digitação manual ou incrementos de 10 páginas.",
             )
             max_year = st.number_input(
-                "Ano maximo",
+                "Ano máximo",
                 min_value=0,
                 value=0,
                 step=10,
-                help="Aceita digitacao manual ou incrementos de 10 anos.",
+                help="Aceita digitação manual ou incrementos de 10 anos.",
             )
 
     genre = custom_genre.strip() or selected_genre.strip()
@@ -352,7 +355,7 @@ def render_book_card(book: dict, show_score: bool = False, position: int | None 
 
     with content_col:
         if position is not None:
-            st.caption(f"Recomendacao {position}")
+            st.caption(f"Recomendação {position}")
         if show_score:
             st.markdown(
                 f'<div class="score-pill">Score {book["score"]:.2f}</div>',
@@ -365,8 +368,8 @@ def render_book_card(book: dict, show_score: bool = False, position: int | None 
             f"""
             <div class="meta-row">
                 <div class="meta-pill">Autores: {authors}</div>
-                <div class="meta-pill">Genero: {categories}</div>
-                <div class="meta-pill">Paginas: {book.get("page_count") or "N/A"}</div>
+                <div class="meta-pill">Gênero: {categories}</div>
+                <div class="meta-pill">Páginas: {book.get("page_count") or "N/A"}</div>
                 <div class="meta-pill">Ano: {book.get("published_year") or "N/A"}</div>
             </div>
             """,
@@ -381,7 +384,7 @@ def render_book_card(book: dict, show_score: bool = False, position: int | None 
 def main() -> None:
     st.set_page_config(
         page_title="Book Recomendations",
-        page_icon=":books:",
+        page_icon="./assets/Bit-logo.png",
         layout="wide",
     )
 
@@ -390,14 +393,14 @@ def main() -> None:
     render_section_header(
         "Busca",
         "Escolha um livro, um autor, ou combine os dois",
-        "Quando um autor e informado, o sistema tenta mostrar primeiro as obras dele e depois amplia a curadoria para autores similares.",
+        "Quando um autor é informado, o sistema tenta mostrar primeiro as obras dele e depois amplia a curadoria para autores similares.",
     )
 
     with st.form("book-search-form"):
         input_col1, input_col2 = st.columns(2, gap="large")
         with input_col1:
             title = st.text_input(
-                "Titulo do livro",
+                "Título do livro",
                 placeholder="Ex.: Duna, 1984, O Hobbit, No Longer Human",
             )
         with input_col2:
@@ -407,17 +410,17 @@ def main() -> None:
             )
 
         filters = build_filters()
-        submitted = st.form_submit_button("Buscar recomendacoes", width="stretch")
+        submitted = st.form_submit_button("Buscar recomendações", width="stretch")
 
     if not submitted:
-        st.info("Preencha um titulo, um autor, ou ambos, e clique em buscar para ver a curadoria.")
+        st.info("Preencha um título, um autor, ou ambos, e clique em buscar para ver a curadoria.")
         return
 
     if not title.strip() and not author.strip():
-        st.warning("Informe pelo menos um titulo ou um autor para continuar.")
+        st.warning("Informe pelo menos um título ou um autor para continuar.")
         return
 
-    with st.spinner("Buscando recomendacoes..."):
+    with st.spinner("Buscando recomendações..."):
         data = get_recommendations(title.strip(), author.strip(), filters)
 
     if not data:
@@ -427,15 +430,15 @@ def main() -> None:
     recommendations = data["recommendations"]
 
     render_section_header(
-        "Referencia",
+        "Referência",
         "Obra usada como base",
-        "Esta obra foi escolhida como referencia principal para calcular similaridade e ordenar os resultados.",
+        "Esta obra foi escolhida como referência principal para calcular similaridade e ordenar os resultados.",
     )
     render_book_card(reference)
 
     render_section_header(
         "Resultados",
-        f"{len(recommendations)} recomendacoes encontradas",
+        f"{len(recommendations)} recomendações encontradas",
         "Quando houver autor informado, as obras do proprio autor aparecem primeiro. Depois entram livros de autores similares ordenados pelo score.",
     )
 
