@@ -412,6 +412,9 @@ def split_same_author_books(
 
     return same_author, other_authors
 
+@app.get("/")
+async def root():
+    return {"service": "Book Recommender API"}
 
 @app.get("/search", response_model=list[BookResponse])
 async def search_books(
