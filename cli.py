@@ -219,6 +219,7 @@ def get_recommendations(title: str, author: str, filters: dict) -> dict | None:
     return response.json()
 
 st.title("Book-it")
+st.caption("Por Babi :)")
 
 def render_intro() -> None:
     st.markdown(
