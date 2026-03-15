@@ -384,7 +384,7 @@ def render_book_card(book: dict, show_score: bool = False, position: int | None 
 
 def main() -> None:
     st.set_page_config(
-        page_title="Book Recomendations",
+        page_title="Book-it Babi",
         page_icon="./assets/Bit-logo.png",
         layout="wide",
     )

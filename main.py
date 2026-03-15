@@ -338,7 +338,11 @@ def build_search_terms(
     return deduped_terms
 
 
-async def fetch_candidate_books(search_terms: list[str], max_results: int = 40) -> list[BookResponse]:
+async def fetch_candidate_books(
+    search_terms: list[str],
+    reference: Optional[BookResponse] = None,
+    max_results: int = 40,
+) -> list[BookResponse]:
     candidates: list[BookResponse] = []
     seen_ids: set[str] = set()
     per_term_limit = max(10, max_results // max(1, len(search_terms)))
@@ -353,6 +357,18 @@ async def fetch_candidate_books(search_terms: list[str], max_results: int = 40) 
             candidates.append(book)
             if len(candidates) >= max_results:
                 return candidates
+
+    # fallback: se candidatos insuficientes e temos autor de referencia,
+    # busca por inauthor — garante resultados mesmo sem categories/subjects
+    if len(candidates) < 5 and reference and reference.authors:
+        author = reference.authors[0]
+        items = await fetch_google_books(f'inauthor:"{author}"', max_results=20)
+        for item in items:
+            book = parse_book(item)
+            if not book or book.id in seen_ids:
+                continue
+            seen_ids.add(book.id)
+            candidates.append(book)
 
     return candidates
 
@@ -461,9 +477,7 @@ async def recommend_books(
     if reference is None and has_text(q):
         if google_available:
             try:
-                reference_items = await fetch_google_books(q.strip(), max_results=5)
-                if reference_items:
-                    reference = parse_book(reference_items[0])
+                reference = await pick_best_reference(q.strip())
             except GoogleBooksUnavailable:
                 google_available = False
 
@@ -488,7 +502,7 @@ async def recommend_books(
     search_terms = build_search_terms(q, reference, category, enriched_subjects)
     if google_available:
         try:
-            thematic_candidates = await fetch_candidate_books(search_terms, max_results=40)
+            thematic_candidates = await fetch_candidate_books(search_terms, reference=reference, max_results=40)
         except GoogleBooksUnavailable:
             google_available = False
             thematic_candidates = await fetch_open_library_candidates(search_terms, max_results=40)
@@ -532,6 +546,99 @@ def parse_book(item: dict) -> Optional[BookResponse]:
         )
     except Exception:
         return None
+
+
+def _title_similarity(a: str, b: str) -> float:
+    """
+    Retorna score de similaridade entre dois titulos normalizados (0.0 a 1.0).
+    Usa Jaccard sobre tokens para lidar com traducoes parciais e abreviacoes.
+    Exemplos:
+      "duna" vs "dune"                           -> 0.0  (tokens diferentes)
+      "1984" vs "nineteen eighty-four"           -> 0.0  (sem token comum)
+      "do androids dream" vs "androids dream"    -> 0.67 (2/3 tokens em comum)
+    """
+    tokens_a = set(normalize_text(a).split())
+    tokens_b = set(normalize_text(b).split())
+    if not tokens_a or not tokens_b:
+        return 0.0
+    intersection = tokens_a & tokens_b
+    union = tokens_a | tokens_b
+    return len(intersection) / len(union)
+
+
+def _reference_score(item: dict, query: str) -> float:
+    """
+    Pontua um candidato a livro de referencia.
+
+    Criterios:
+    - Titulo exato                    : +10.0
+    - Similaridade de tokens (Jaccard): +0 a +6.0
+    - Tem description preenchida      : +3.0  (proxy de obra relevante)
+    - Tem pageCount                   : +2.0
+    - Tem thumbnail                   : +1.0
+    - averageRating da API            : +0 a +1.0 (normalizado por 5.0)
+    - ratingsCount deliberadamente EXCLUIDO — enviesado por docs governamentais
+    """
+    info   = item.get("volumeInfo", {})
+    title  = info.get("title", "")
+    q_norm = normalize_text(query)
+    score  = 0.0
+
+    if normalize_text(title) == q_norm:
+        score += 10.0
+    else:
+        sim = _title_similarity(title, query)
+        score += sim * 6.0
+
+    if info.get("description"):
+        score += 3.0
+    if info.get("pageCount"):
+        score += 2.0
+    if info.get("imageLinks", {}).get("thumbnail"):
+        score += 1.0
+
+    avg_rating = info.get("averageRating")
+    if avg_rating:
+        score += (avg_rating / 5.0)
+
+    return score
+
+
+async def pick_best_reference(query: str) -> Optional[BookResponse]:
+    """
+    Busca o livro de referencia usando duas estrategias complementares:
+
+    1. intitle:"query" — restringe a API a titulos que contenham o termo exato,
+       reduzindo drasticamente falsos positivos como documentos governamentais
+       ou periodicos academicos.
+    2. query livre — fallback caso intitle nao retorne resultados uteis.
+
+    Dentre todos os candidatos coletados, escolhe o melhor pelo _reference_score,
+    que prioriza correspondencia de titulo e presenca de metadados (description,
+    pageCount), sem usar ratingsCount que e enviesado.
+    """
+    all_items: list[dict] = []
+
+    # estrategia 1: intitle restringe bem
+    try:
+        intitle_items = await fetch_google_books(f'intitle:"{query.strip()}"', max_results=10)
+        all_items.extend(intitle_items)
+    except GoogleBooksUnavailable:
+        pass
+
+    # estrategia 2: busca livre como complemento
+    try:
+        free_items = await fetch_google_books(query.strip(), max_results=10)
+        seen_ids = {item.get("id") for item in all_items}
+        all_items.extend(item for item in free_items if item.get("id") not in seen_ids)
+    except GoogleBooksUnavailable:
+        pass
+
+    if not all_items:
+        return None
+
+    ranked = sorted(all_items, key=lambda item: _reference_score(item, query), reverse=True)
+    return parse_book(ranked[0])
 
 
 @app.get("/health")
