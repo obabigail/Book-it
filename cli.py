@@ -4,6 +4,7 @@ import httpx
 import streamlit as st
 
 BASE_URL = os.getenv("BOOKIT_BASE_URL", "http://localhost:8000")
+REQUEST_TIMEOUT_SECONDS = float(os.getenv("BOOKIT_REQUEST_TIMEOUT_SECONDS", "30"))
 COMMON_GENRES = [
     "",
     "Fiction",
@@ -195,12 +196,18 @@ def get_recommendations(title: str, author: str, filters: dict) -> dict | None:
     params = {key: value for key, value in params.items() if value not in ("", None)}
 
     try:
-        with httpx.Client(timeout=15.0) as client:
+        with httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS) as client:
             response = client.get(f"{BASE_URL}/recommend", params=params)
     except httpx.ConnectError:
         st.error(
             f"Não foi possivel conectar ao backend em `{BASE_URL}`. "
             "Verifique se o FastAPI está em execução."
+        )
+        return None
+    except httpx.ReadTimeout:
+        st.error(
+            "A busca demorou mais do que o esperado. "
+            "Tente novamente ou refine a consulta com tÃ­tulo, autor ou categoria."
         )
         return None
 
@@ -275,7 +282,7 @@ def render_section_header(kicker: str, title: str, copy: str) -> None:
 
 
 def build_filters() -> dict:
-    with st.expander("Filtros de recomendação", expanded=True):
+    with st.expander("Filtros de recomendação", expanded=False):
         st.caption("Use 0 para ignorar filtros numéricos.")
 
         top_left, top_right = st.columns([1.6, 1], gap="large")

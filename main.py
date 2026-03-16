@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import time
@@ -30,6 +31,8 @@ API_KEY = os.getenv("GOOGLE_BOOKS_API_KEY")
 CACHE_TTL_SECONDS = int(os.getenv("BOOKIT_CACHE_TTL_SECONDS", "21600"))
 CACHE_MAX_ITEMS = int(os.getenv("BOOKIT_CACHE_MAX_ITEMS", "512"))
 GOOGLE_COOLDOWN_SECONDS = int(os.getenv("BOOKIT_GOOGLE_COOLDOWN_SECONDS", "900"))
+MIN_RECOMMENDATION_SCORE = float(os.getenv("BOOKIT_MIN_RECOMMENDATION_SCORE", "0.18"))
+MAX_SEARCH_TERMS = int(os.getenv("BOOKIT_MAX_SEARCH_TERMS", "4"))
 GENERIC_SUBJECTS = {
     "fiction",
     "ficcao",
@@ -163,7 +166,7 @@ def parse_open_library_doc(doc: dict) -> Optional[BookResponse]:
             id=doc.get("key", ""),
             title=doc.get("title", "Sem titulo"),
             authors=doc.get("author_name", []) or [],
-            categories=subjects[:3],
+            categories=subjects[:6],
             page_count=doc.get("number_of_pages_median"),
             published_year=doc.get("first_publish_year"),
             description="",
@@ -198,6 +201,27 @@ async def fetch_open_library_books_by_query(query: str, max_results: int = 20) -
         "limit": max_results,
         "fields": "key,title,author_name,first_publish_year,cover_i,subject,language,number_of_pages_median",
     }
+    docs = await fetch_open_library_search(params)
+    books = [parse_open_library_doc(doc) for doc in docs]
+    return [book for book in books if book is not None]
+
+
+async def fetch_open_library_books_by_subject(
+    subject: str,
+    author: Optional[str] = None,
+    language: Optional[str] = None,
+    max_results: int = 20,
+) -> list[BookResponse]:
+    params = {
+        "subject": subject.strip(),
+        "limit": max_results,
+        "fields": "key,title,author_name,first_publish_year,cover_i,subject,language,number_of_pages_median",
+    }
+    if has_text(author):
+        params["author"] = author.strip()
+    if has_text(language):
+        params["language"] = language.strip()
+
     docs = await fetch_open_library_search(params)
     books = [parse_open_library_doc(doc) for doc in docs]
     return [book for book in books if book is not None]
@@ -305,6 +329,11 @@ def select_specific_subjects(subjects: list[str], limit: int = 3) -> list[str]:
     return selected
 
 
+def normalize_book_signature(book: BookResponse) -> str:
+    author = normalize_text(book.authors[0]) if book.authors else ""
+    return f"{normalize_text(book.title)}::{author}"
+
+
 def build_search_terms(
     q: Optional[str],
     reference: BookResponse,
@@ -318,21 +347,17 @@ def build_search_terms(
 
     ordered_terms.extend(subject for subject in enriched_subjects if subject.strip())
 
-    if reference.categories:
-        ordered_terms.append(reference.categories[0].strip())
-
-    if has_text(q):
-        ordered_terms.append(q.strip())
+    ordered_terms.extend(select_specific_subjects(reference.categories, limit=4))
 
     deduped_terms = []
     seen = set()
     for term in ordered_terms:
         normalized = normalize_text(term)
-        if not normalized or normalized in seen:
+        if not normalized or normalized in seen or normalized in GENERIC_SUBJECTS:
             continue
         seen.add(normalized)
         deduped_terms.append(term)
-        if len(deduped_terms) >= 3:
+        if len(deduped_terms) >= MAX_SEARCH_TERMS:
             break
 
     return deduped_terms
@@ -345,18 +370,32 @@ async def fetch_candidate_books(
 ) -> list[BookResponse]:
     candidates: list[BookResponse] = []
     seen_ids: set[str] = set()
-    per_term_limit = max(10, max_results // max(1, len(search_terms)))
+    seen_signatures: set[str] = set()
+    per_term_limit = max(6, max_results // max(1, len(search_terms)))
+    reference_author = reference.authors[0] if reference and reference.authors else None
 
     for term in search_terms:
-        items = await fetch_google_books(f"subject:{term.strip()}", max_results=per_term_limit)
-        parsed_books = [parse_book(item) for item in items]
-        for book in parsed_books:
-            if not book or book.id in seen_ids:
-                continue
-            seen_ids.add(book.id)
-            candidates.append(book)
-            if len(candidates) >= max_results:
-                return candidates
+        queries = []
+        if has_text(reference_author):
+            queries.append(f'subject:"{term.strip()}" inauthor:"{reference_author.strip()}"')
+        queries.append(f'subject:"{term.strip()}"')
+
+        items_batches = await asyncio.gather(
+            *[fetch_google_books(query, max_results=per_term_limit) for query in queries]
+        )
+        for items in items_batches:
+            parsed_books = [parse_book(item) for item in items]
+            for book in parsed_books:
+                if not book or book.id in seen_ids:
+                    continue
+                signature = normalize_book_signature(book)
+                if signature in seen_signatures:
+                    continue
+                seen_ids.add(book.id)
+                seen_signatures.add(signature)
+                candidates.append(book)
+                if len(candidates) >= max_results:
+                    return candidates
 
     # fallback: se candidatos insuficientes e temos autor de referencia,
     # busca por inauthor — garante resultados mesmo sem categories/subjects
@@ -367,23 +406,69 @@ async def fetch_candidate_books(
             book = parse_book(item)
             if not book or book.id in seen_ids:
                 continue
+            signature = normalize_book_signature(book)
+            if signature in seen_signatures:
+                continue
             seen_ids.add(book.id)
+            seen_signatures.add(signature)
             candidates.append(book)
 
     return candidates
 
 
-async def fetch_open_library_candidates(search_terms: list[str], max_results: int = 40) -> list[BookResponse]:
+async def fetch_open_library_candidates(
+    search_terms: list[str],
+    reference: Optional[BookResponse] = None,
+    max_results: int = 40,
+) -> list[BookResponse]:
     candidates: list[BookResponse] = []
     seen_ids: set[str] = set()
-    per_term_limit = max(10, max_results // max(1, len(search_terms)))
+    seen_signatures: set[str] = set()
+    per_term_limit = max(6, max_results // max(1, len(search_terms)))
+    reference_author = reference.authors[0] if reference and reference.authors else None
+    reference_language = reference.language if reference else None
 
     for term in search_terms:
-        books = await fetch_open_library_books_by_query(term.strip(), max_results=per_term_limit)
-        for book in books:
+        batches = await asyncio.gather(
+            fetch_open_library_books_by_subject(
+                term.strip(),
+                author=reference_author,
+                language=reference_language,
+                max_results=per_term_limit,
+            ),
+            fetch_open_library_books_by_subject(
+                term.strip(),
+                language=reference_language,
+                max_results=per_term_limit,
+            ),
+        )
+
+        for books in batches:
+            for book in books:
+                if not book or book.id in seen_ids:
+                    continue
+                signature = normalize_book_signature(book)
+                if signature in seen_signatures:
+                    continue
+                seen_ids.add(book.id)
+                seen_signatures.add(signature)
+                candidates.append(book)
+                if len(candidates) >= max_results:
+                    return candidates
+
+    if len(candidates) < 5 and reference and reference.authors:
+        fallback_books = await fetch_open_library_books_by_author(
+            reference.authors[0],
+            max_results=min(20, max_results),
+        )
+        for book in fallback_books:
             if not book or book.id in seen_ids:
                 continue
+            signature = normalize_book_signature(book)
+            if signature in seen_signatures:
+                continue
             seen_ids.add(book.id)
+            seen_signatures.add(signature)
             candidates.append(book)
             if len(candidates) >= max_results:
                 return candidates
@@ -394,39 +479,17 @@ async def fetch_open_library_candidates(search_terms: list[str], max_results: in
 def dedupe_books(books: list[BookResponse]) -> list[BookResponse]:
     deduped = []
     seen_ids: set[str] = set()
+    seen_signatures: set[str] = set()
 
     for book in books:
-        if book.id in seen_ids:
+        signature = normalize_book_signature(book)
+        if book.id in seen_ids or signature in seen_signatures:
             continue
         seen_ids.add(book.id)
+        seen_signatures.add(signature)
         deduped.append(book)
 
     return deduped
-
-
-def split_same_author_books(
-    books: list[BookResponse],
-    author: Optional[str],
-    reference: BookResponse,
-) -> tuple[list[BookResponse], list[BookResponse]]:
-    if not has_text(author):
-        return [], books
-
-    requested_author = normalize_text(author)
-    same_author = []
-    other_authors = []
-
-    for book in books:
-        if normalize_text(book.title) == normalize_text(reference.title):
-            continue
-
-        book_authors = {normalize_text(book_author) for book_author in book.authors}
-        if requested_author in book_authors:
-            same_author.append(book)
-        else:
-            other_authors.append(book)
-
-    return same_author, other_authors
 
 @app.get("/")
 async def root():
@@ -505,9 +568,9 @@ async def recommend_books(
             thematic_candidates = await fetch_candidate_books(search_terms, reference=reference, max_results=40)
         except GoogleBooksUnavailable:
             google_available = False
-            thematic_candidates = await fetch_open_library_candidates(search_terms, max_results=40)
+            thematic_candidates = await fetch_open_library_candidates(search_terms, reference=reference, max_results=40)
     else:
-        thematic_candidates = await fetch_open_library_candidates(search_terms, max_results=40)
+        thematic_candidates = await fetch_open_library_candidates(search_terms, reference=reference, max_results=40)
     candidates = dedupe_books(author_books + thematic_candidates)
 
     filters = {
@@ -519,10 +582,8 @@ async def recommend_books(
         "exclude_title": reference.title,
     }
     filtered = filter_books(candidates, filters)
-    same_author_books, other_author_books = split_same_author_books(filtered, author, reference)
-    scored_same_author = score_books(same_author_books, reference)
-    scored_other_authors = score_books(other_author_books, reference)
-    scored = scored_same_author + scored_other_authors
+    scored = score_books(filtered, reference)
+    scored = [book for book in scored if book.score >= MIN_RECOMMENDATION_SCORE]
 
     return RecommendationResponse(reference=reference, recommendations=scored[:limit])
 
