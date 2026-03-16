@@ -1,79 +1,191 @@
-# Book Recommender — Backend
+# Book-it
 
-## Setup no Termux
+Aplicacao de recomendacao de livros com:
+
+- backend em `FastAPI`
+- interface web em `Streamlit`
+- busca em `Google Books` com fallback para `Open Library`
+
+O fluxo atual do app foi desenhado para reduzir ambiguidades:
+
+1. o usuario pesquisa um titulo
+2. o app mostra sugestoes de obras-base
+3. a obra correta e selecionada visualmente
+4. a recomendacao usa o `id` da obra escolhida
+5. resultados repetidos por edicoes muito parecidas sao deduplicados
+
+## Principais recursos
+
+- selecao guiada da obra-base antes de recomendar similares
+- ordenacao de sugestoes para priorizar versoes mais conhecidas em buscas vagas como `1984` e `Duna`
+- busca de recomendacoes com filtros por genero, paginas, ano e limite
+- score de similaridade com titulo, categorias, autor, idioma, descricao, paginas e ano
+- deduplicacao de edicoes parecidas no ranking final
+- fallback para Open Library quando Google Books estiver indisponivel
+
+## Requisitos
+
+- Python 3.10+
+
+Dependencias atuais em [`requirements.txt`](C:\Users\riquelmy.fernandes\Downloads\Book-it\requirements.txt):
+
+- `fastapi`
+- `uvicorn`
+- `httpx`
+- `pydantic`
+- `streamlit`
+
+## Instalacao
 
 ```bash
-# 1. dependências do sistema
-pkg update && pkg install python git
-
-# 2. dependências Python
+python -m venv .venv
+.venv\Scripts\activate
 pip install -r requirements.txt
+```
 
-# 3. chave da API (Google Cloud Console)
-export GOOGLE_BOOKS_API_KEY="sua_chave_aqui"
+## Variaveis de ambiente
 
-# 4. rodar
+Opcional:
+
+- `GOOGLE_BOOKS_API_KEY`
+
+Ajustes uteis:
+
+- `BOOKIT_BASE_URL`
+  URL do backend usada pelo Streamlit.
+  Padrao: `http://localhost:8000`
+- `BOOKIT_REQUEST_TIMEOUT_SECONDS`
+  Timeout do frontend ao chamar o backend.
+  Padrao: `30`
+- `BOOKIT_CACHE_TTL_SECONDS`
+  TTL do cache em memoria no backend.
+  Padrao: `21600`
+- `BOOKIT_CACHE_MAX_ITEMS`
+  Quantidade maxima de itens em cache.
+  Padrao: `512`
+- `BOOKIT_GOOGLE_COOLDOWN_SECONDS`
+  Janela de cooldown quando Google Books devolve quota excedida.
+  Padrao: `900`
+- `BOOKIT_MIN_RECOMMENDATION_SCORE`
+  Score minimo para um livro entrar nas recomendacoes.
+  Padrao: `0.18`
+- `BOOKIT_MAX_SEARCH_TERMS`
+  Quantidade maxima de termos tematicos usados na busca de candidatos.
+  Padrao: `4`
+
+Sem chave de API o servidor ainda funciona, mas o limite do Google Books tende a ser menor.
+
+## Como rodar
+
+Suba o backend:
+
+```bash
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-Sem chave de API o servidor ainda funciona — o Google Books aceita
-requisições sem autenticação com limite menor (~100/dia por IP).
+Em outro terminal, suba o web app:
 
----
+```bash
+streamlit run cli.py
+```
+
+## Fluxo do web app
+
+1. preencher `Titulo do livro` e opcionalmente `Autor`
+2. clicar em `Encontrar obra-base`
+3. escolher uma capa na estante de referencias
+4. clicar em `Buscar recomendacoes com esta obra`
+5. revisar a obra-base confirmada e os livros recomendados
+
+Se o usuario informar apenas autor, o app ainda permite partir diretamente desse autor.
 
 ## Endpoints
 
-### GET /search
-Busca livros por título ou termo.
+### `GET /`
 
-```
-GET /search?q=1984&max_results=10
-```
+Health simples do servico.
 
-### GET /recommend
-Recomenda livros similares com filtros opcionais.
+### `GET /search`
 
-```
-GET /recommend?q=1984&min_pages=200&max_pages=400&min_year=1990&limit=5
-GET /recommend?q=1984&category=Fiction&limit=5
-```
+Busca sugestoes de obras-base para a etapa guiada.
 
-### GET /health
-Verifica se o servidor está rodando e se a chave de API está configurada.
+Parametros:
 
----
+- `q`: titulo ou termo principal
+- `author`: autor opcional para refinar
+- `max_results`: quantidade maxima de sugestoes
 
-## Documentação interativa
+Exemplo:
 
-Com o servidor rodando, acesse no browser do celular:
-
-```
-http://localhost:8000/docs
+```text
+GET /search?q=1984&author=George Orwell&max_results=8
 ```
 
-O Swagger gerado pelo FastAPI permite testar todos os endpoints sem curl.
+### `GET /recommend`
 
----
+Retorna recomendacoes similares.
 
-## Estrutura dos arquivos
+Parametros principais:
 
+- `reference_id`: id explicito da obra-base selecionada
+- `q`: titulo de apoio
+- `author`: autor de apoio
+- `category`
+- `min_pages`
+- `max_pages`
+- `min_year`
+- `max_year`
+- `limit`
+
+Exemplos:
+
+```text
+GET /recommend?reference_id=zyTCAlFPjgYC&limit=5
+GET /recommend?reference_id=zyTCAlFPjgYC&category=Science%20Fiction&limit=8
+GET /recommend?q=1984&author=George%20Orwell&limit=5
 ```
-book-recommender/
-├── main.py         # rotas e lógica de fetch
-├── models.py       # schemas Pydantic
-├── filters.py      # filtragem e scoring de similaridade
-└── requirements.txt
+
+### `GET /health`
+
+Retorna status basico da API e informa se a chave do Google Books esta configurada.
+
+## Estrutura do projeto
+
+```text
+Book-it/
+|- main.py          # backend FastAPI e logica de busca/recomendacao
+|- cli.py           # interface Streamlit
+|- filters.py       # filtros e score de similaridade
+|- models.py        # modelos Pydantic
+|- requirements.txt
+|- assets/
 ```
 
-## Lógica de scoring
+## Como a recomendacao funciona hoje
 
-O endpoint `/recommend` pontua cada livro candidato por similaridade
-com o livro de referência. Pesos atuais:
+De forma resumida:
 
-| Critério           | Peso |
-|--------------------|------|
-| Categoria em comum | 0.50 |
-| Proximidade páginas| 0.30 |
-| Proximidade de ano | 0.20 |
+1. resolve a obra-base a partir do `reference_id` selecionado ou por busca assistida
+2. enriquece subjects/categorias da referencia
+3. busca candidatos tematicos em Google Books ou Open Library
+4. remove duplicatas e edicoes muito parecidas
+5. aplica filtros do usuario
+6. calcula score de similaridade
+7. devolve apenas livros acima do score minimo
 
-Os pesos podem ser ajustados em `filters.py` na função `score_books`.
+Sinais usados no score:
+
+- categorias em comum
+- mesmo autor
+- proximidade de paginas
+- proximidade de ano
+- idioma
+- similaridade de titulo
+- overlap de keywords da descricao
+- especificidade das categorias
+
+## Observacoes
+
+- a selecao guiada melhora bastante consultas vagas, mas ainda depende da qualidade dos metadados das APIs externas
+- ids do Google Books tendem a ser resolvidos com mais precisao do que ids do Open Library
+- recomendacoes podem variar conforme disponibilidade e metadata retornada pelas APIs externas
