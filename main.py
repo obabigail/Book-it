@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import time
 from collections import OrderedDict
 from typing import Optional
@@ -137,6 +138,35 @@ async def fetch_google_books(query: str, max_results: int = 20) -> list[dict]:
     return items
 
 
+async def fetch_google_book_by_id(volume_id: str) -> Optional[dict]:
+    if not _google_books_available():
+        raise GoogleBooksUnavailable("Google Books temporariamente indisponivel")
+
+    params = {}
+    if API_KEY:
+        params["key"] = API_KEY
+
+    cache_key = _cache_key("google_book_by_id", {"id": volume_id, "keyed": bool(API_KEY)})
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.get(f"{GOOGLE_BOOKS_API}/{volume_id}", params=params)
+
+    if response.status_code in (403, 429):
+        _mark_google_unavailable()
+        raise GoogleBooksUnavailable("Google Books quota excedida")
+    if response.status_code == 404:
+        return None
+    if response.status_code != 200:
+        raise HTTPException(status_code=502, detail="Falha ao consultar Google Books por id")
+
+    item = response.json()
+    _cache_set(cache_key, item)
+    return item
+
+
 async def fetch_open_library_search(params: dict) -> list[dict]:
     cache_key = _cache_key("open_library_search", params)
     cached = _cache_get(cache_key)
@@ -204,6 +234,21 @@ async def fetch_open_library_books_by_query(query: str, max_results: int = 20) -
     docs = await fetch_open_library_search(params)
     books = [parse_open_library_doc(doc) for doc in docs]
     return [book for book in books if book is not None]
+
+
+async def fetch_open_library_book_by_id(book_id: str) -> Optional[BookResponse]:
+    params = {
+        "q": book_id.strip(),
+        "limit": 10,
+        "fields": "key,title,author_name,first_publish_year,cover_i,subject,language,number_of_pages_median",
+    }
+    docs = await fetch_open_library_search(params)
+    books = [parse_open_library_doc(doc) for doc in docs]
+    normalized_id = normalize_text(book_id)
+    for book in books:
+        if book and normalize_text(book.id) == normalized_id:
+            return book
+    return None
 
 
 async def fetch_open_library_books_by_subject(
@@ -329,9 +374,41 @@ def select_specific_subjects(subjects: list[str], limit: int = 3) -> list[str]:
     return selected
 
 
+def canonicalize_title(title: str) -> str:
+    normalized = normalize_text(title)
+    normalized = re.sub(r"\(.*?\)|\[.*?\]", " ", normalized)
+    normalized = re.split(r"[:\-|/]", normalized, maxsplit=1)[0]
+    normalized = re.sub(
+        r"\b(edition|edicao|edição|revised|updated|illustrated|illustrado|illustrated edition|anniversary|special edition|collector'?s edition|box set|paperback|hardcover)\b",
+        " ",
+        normalized,
+    )
+    normalized = re.sub(r"\b(book|livro|volume|vol\.?)\s+\d+\b", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
 def normalize_book_signature(book: BookResponse) -> str:
     author = normalize_text(book.authors[0]) if book.authors else ""
-    return f"{normalize_text(book.title)}::{author}"
+    return f"{canonicalize_title(book.title)}::{author}"
+
+
+async def resolve_reference_book(reference_id: str) -> Optional[BookResponse]:
+    if not has_text(reference_id):
+        return None
+
+    if reference_id.startswith("/works/") or reference_id.startswith("/books/"):
+        return await fetch_open_library_book_by_id(reference_id)
+
+    try:
+        item = await fetch_google_book_by_id(reference_id)
+    except GoogleBooksUnavailable:
+        item = None
+
+    if item:
+        return parse_book(item)
+
+    return await fetch_open_library_book_by_id(reference_id)
 
 
 def build_search_terms(
@@ -491,6 +568,49 @@ def dedupe_books(books: list[BookResponse]) -> list[BookResponse]:
 
     return deduped
 
+
+def _author_match_score(authors: list[str], author_query: Optional[str]) -> float:
+    if not has_text(author_query):
+        return 0.0
+
+    normalized_query = normalize_text(author_query)
+    normalized_authors = {normalize_text(author) for author in authors}
+    if normalized_query in normalized_authors:
+        return 1.0
+    if any(normalized_query in author or author in normalized_query for author in normalized_authors):
+        return 0.6
+    return 0.0
+
+
+def _search_result_score(item: dict, title_query: str, author_query: Optional[str] = None) -> float:
+    info = item.get("volumeInfo", {})
+    score = _reference_score(item, title_query)
+
+    authors = info.get("authors", []) or []
+    score += _author_match_score(authors, author_query) * 4.0
+
+    ratings_count = info.get("ratingsCount") or 0
+    if ratings_count:
+        score += min(3.0, ratings_count / 500)
+
+    categories = [normalize_text(category) for category in info.get("categories", []) or []]
+    if any(category not in GENERIC_SUBJECTS for category in categories):
+        score += 1.0
+
+    return score
+
+
+def _open_library_search_score(book: BookResponse, title_query: str, author_query: Optional[str] = None) -> float:
+    score = _title_similarity(book.title, title_query) * 8.0
+    score += _author_match_score(book.authors, author_query) * 4.0
+    if book.thumbnail:
+        score += 1.0
+    if book.categories and any(normalize_text(category) not in GENERIC_SUBJECTS for category in book.categories):
+        score += 1.0
+    if book.published_year:
+        score += 0.5
+    return score
+
 @app.get("/")
 async def root():
     return {"service": "Book Recommender API"}
@@ -498,21 +618,48 @@ async def root():
 @app.get("/search", response_model=list[BookResponse])
 async def search_books(
     q: str = Query(..., description="Titulo ou termo de busca"),
+    author: Optional[str] = Query(None, description="Autor opcional para refinar a referencia"),
     max_results: int = Query(10, ge=1, le=40),
 ):
     try:
-        items = await fetch_google_books(q, max_results)
-        books = [parse_book(item) for item in items]
+        queries = [f'intitle:"{q.strip()}"']
+        if has_text(author):
+            queries.insert(0, f'intitle:"{q.strip()}" inauthor:"{author.strip()}"')
+            queries.append(f'{q.strip()} inauthor:"{author.strip()}"')
+        queries.append(q.strip())
+
+        batches = await asyncio.gather(*[fetch_google_books(query, max_results=max_results) for query in queries])
+        seen_ids: set[str] = set()
+        ranked_items: list[dict] = []
+        for items in batches:
+            for item in items:
+                item_id = item.get("id")
+                if item_id in seen_ids:
+                    continue
+                seen_ids.add(item_id)
+                ranked_items.append(item)
+
+        ranked_items.sort(
+            key=lambda item: _search_result_score(item, q.strip(), author),
+            reverse=True,
+        )
+        books = [parse_book(item) for item in ranked_items[:max_results]]
         return [book for book in books if book is not None]
     except GoogleBooksUnavailable:
-        books = await fetch_open_library_books_by_query(q, max_results=max_results)
-        return books
+        query = f"{q.strip()} {author.strip()}" if has_text(author) else q.strip()
+        books = await fetch_open_library_books_by_query(query, max_results=max_results)
+        books.sort(
+            key=lambda book: _open_library_search_score(book, q.strip(), author),
+            reverse=True,
+        )
+        return books[:max_results]
 
 
 @app.get("/recommend", response_model=RecommendationResponse)
 async def recommend_books(
     q: Optional[str] = Query(None, description="Titulo de referencia para recomendacao"),
     author: Optional[str] = Query(None, description="Autor para priorizar obras relacionadas"),
+    reference_id: Optional[str] = Query(None, description="Id explicito da obra-base selecionada"),
     min_pages: Optional[int] = Query(None, ge=1),
     max_pages: Optional[int] = Query(None, ge=1),
     min_year: Optional[int] = Query(None, ge=1000, le=2100),
@@ -520,7 +667,7 @@ async def recommend_books(
     category: Optional[str] = Query(None, description="Genero/categoria desejada"),
     limit: int = Query(5, ge=1, le=20),
 ):
-    if not has_text(q) and not has_text(author):
+    if not has_text(q) and not has_text(author) and not has_text(reference_id):
         raise HTTPException(
             status_code=422,
             detail="Informe pelo menos um titulo ou autor para recomendar livros",
@@ -528,14 +675,19 @@ async def recommend_books(
 
     google_available = True
     author_books: list[BookResponse] = []
-    if has_text(author):
+    if has_text(author) and not has_text(reference_id):
         try:
             author_books = await fetch_books_by_author(author.strip(), q, max_results=20)
         except GoogleBooksUnavailable:
             google_available = False
             author_books = await fetch_open_library_books_by_author(author.strip(), q, max_results=20)
 
-    reference: Optional[BookResponse] = author_books[0] if author_books else None
+    reference: Optional[BookResponse] = None
+    if has_text(reference_id):
+        reference = await resolve_reference_book(reference_id.strip())
+
+    if reference is None:
+        reference = author_books[0] if author_books else None
 
     if reference is None and has_text(q):
         if google_available:
@@ -572,6 +724,8 @@ async def recommend_books(
     else:
         thematic_candidates = await fetch_open_library_candidates(search_terms, reference=reference, max_results=40)
     candidates = dedupe_books(author_books + thematic_candidates)
+    reference_signature = normalize_book_signature(reference)
+    candidates = [book for book in candidates if normalize_book_signature(book) != reference_signature]
 
     filters = {
         "min_pages": min_pages,

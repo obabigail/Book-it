@@ -176,6 +176,42 @@ def apply_page_styles() -> None:
                 border-radius: 18px;
                 background: rgba(255, 252, 247, 0.72);
             }
+
+            .shelf-strip {
+                height: 18px;
+                border-radius: 999px;
+                background: linear-gradient(180deg, #7d5a3b, #5f4129);
+                box-shadow: inset 0 2px 4px rgba(255,255,255,0.18), 0 8px 18px rgba(48, 34, 23, 0.16);
+                margin: 0.4rem 0 1rem 0;
+            }
+
+            .reference-choice {
+                min-height: 170px;
+                padding: 0.75rem 0.75rem 0.65rem 0.75rem;
+                border-radius: 18px;
+                background: linear-gradient(180deg, rgba(255, 252, 247, 0.96), rgba(242, 232, 219, 0.88));
+                border: 1px solid rgba(126, 99, 76, 0.16);
+                box-shadow: 0 12px 24px rgba(55, 43, 35, 0.08);
+                margin-top: 0.55rem;
+            }
+
+            .reference-choice.is-selected {
+                border: 2px solid rgba(128, 89, 43, 0.55);
+                box-shadow: 0 14px 28px rgba(89, 59, 29, 0.16);
+            }
+
+            .reference-choice-title {
+                font-size: 0.96rem;
+                font-weight: 700;
+                color: #3f332b;
+                margin-bottom: 0.35rem;
+            }
+
+            .reference-choice-meta {
+                font-size: 0.83rem;
+                color: rgba(63, 51, 43, 0.82);
+                line-height: 1.45;
+            }
         </style>
         """,
         unsafe_allow_html=True,
@@ -186,13 +222,18 @@ def normalize_optional_number(value: int) -> int | None:
     return value if value > 0 else None
 
 
-def get_recommendations(title: str, author: str, filters: dict) -> dict | None:
+def get_recommendations(title: str, author: str, filters: dict, reference_id: str = "") -> dict | None:
     cleaned_filters = {
         key: value
         for key, value in filters.items()
         if value is not None and value != ""
     }
-    params = {"q": title.strip(), "author": author.strip(), **cleaned_filters}
+    params = {
+        "q": title.strip(),
+        "author": author.strip(),
+        "reference_id": reference_id.strip(),
+        **cleaned_filters,
+    }
     params = {key: value for key, value in params.items() if value not in ("", None)}
 
     try:
@@ -225,8 +266,42 @@ def get_recommendations(title: str, author: str, filters: dict) -> dict | None:
 
     return response.json()
 
-st.title("Book-it")
-st.caption("Por Babi :)")
+
+def search_reference_books(title: str, author: str = "", max_results: int = 8) -> list[dict]:
+    if not title.strip():
+        return []
+
+    try:
+        with httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+            response = client.get(
+                f"{BASE_URL}/search",
+                params={
+                    "q": title.strip(),
+                    "author": author.strip() or None,
+                    "max_results": max_results,
+                },
+            )
+    except httpx.ConnectError:
+        st.error(
+            f"Nao foi possivel conectar ao backend em `{BASE_URL}`. "
+            "Verifique se o FastAPI esta em execucao."
+        )
+        return []
+    except httpx.ReadTimeout:
+        st.error("A busca de obras-base demorou mais do que o esperado.")
+        return []
+
+    if response.status_code != 200:
+        st.error(f"Erro da API ao buscar obras-base ({response.status_code}): {response.text}")
+        return []
+
+    return response.json()
+
+
+def clear_reference_candidates() -> None:
+    st.session_state["reference_candidates"] = []
+    st.session_state["reference_query"] = ""
+    st.session_state["selected_reference_id"] = ""
 
 def render_intro() -> None:
     st.markdown(
@@ -389,6 +464,57 @@ def render_book_card(book: dict, show_score: bool = False, position: int | None 
     st.markdown("</div>", unsafe_allow_html=True)
 
 
+def render_reference_shelf(candidates: list[dict]) -> dict | None:
+    if not candidates:
+        return None
+
+    st.markdown('<div class="shelf-strip"></div>', unsafe_allow_html=True)
+    columns = st.columns(min(4, len(candidates)), gap="large")
+
+    for index, book in enumerate(candidates):
+        selected_id = st.session_state.get("selected_reference_id", "")
+        is_selected = selected_id == book.get("id")
+        with columns[index % len(columns)]:
+            if book.get("thumbnail"):
+                st.image(book["thumbnail"], width="stretch")
+            else:
+                st.markdown('<div class="reference-choice"><div class="reference-choice-meta">Sem capa disponivel</div></div>', unsafe_allow_html=True)
+
+            authors = ", ".join(book.get("authors", [])[:2]) or "Autor desconhecido"
+            year = book.get("published_year") or "Ano N/A"
+            categories = ", ".join(book.get("categories", [])[:2]) or "Genero N/A"
+            selected_class = " is-selected" if is_selected else ""
+            st.markdown(
+                f"""
+                <div class="reference-choice{selected_class}">
+                    <div class="reference-choice-title">{book.get("title", "Sem titulo")}</div>
+                    <div class="reference-choice-meta">{authors}</div>
+                    <div class="reference-choice-meta">{year}</div>
+                    <div class="reference-choice-meta">{categories}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            if st.button(
+                "Selecionado" if is_selected else "Selecionar",
+                key=f"select-reference-{book.get('id', index)}",
+                width="stretch",
+                disabled=is_selected,
+            ):
+                st.session_state["selected_reference_id"] = book.get("id", "")
+                st.rerun()
+
+    selected_id = st.session_state.get("selected_reference_id", "")
+    if not selected_id:
+        return None
+
+    for book in candidates:
+        if book.get("id") == selected_id:
+            return book
+
+    return None
+
+
 def main() -> None:
     st.set_page_config(
         page_title="Book-it Babi",
@@ -396,19 +522,28 @@ def main() -> None:
         layout="wide",
     )
 
+    st.title("Book-it")
+    st.caption("Por Babi :)")
     apply_page_styles()
     render_intro()
     render_section_header(
         "Busca",
-        "Escolha um livro, um autor, ou combine os dois",
-        "Quando um autor é informado, o sistema tenta mostrar primeiro as obras dele e depois amplia a curadoria para autores similares.",
+        "Escolha e confirme a obra-base",
+        "Quando houver titulo, o fluxo ajuda voce a selecionar a obra correta antes de buscar recomendacoes.",
     )
+
+    if "reference_candidates" not in st.session_state:
+        st.session_state["reference_candidates"] = []
+    if "reference_query" not in st.session_state:
+        st.session_state["reference_query"] = ""
+    if "selected_reference_id" not in st.session_state:
+        st.session_state["selected_reference_id"] = ""
 
     with st.form("book-search-form"):
         input_col1, input_col2 = st.columns(2, gap="large")
         with input_col1:
             title = st.text_input(
-                "Título do livro",
+                "Titulo do livro",
                 placeholder="Ex.: Duna, 1984, O Hobbit, No Longer Human",
             )
         with input_col2:
@@ -418,18 +553,69 @@ def main() -> None:
             )
 
         filters = build_filters()
-        submitted = st.form_submit_button("Buscar recomendações", width="stretch")
-
-    if not submitted:
-        st.info("Preencha um título, um autor, ou ambos, e clique em buscar para ver a curadoria.")
-        return
+        submitted = st.form_submit_button("Encontrar obra-base", width="stretch")
 
     if not title.strip() and not author.strip():
-        st.warning("Informe pelo menos um título ou um autor para continuar.")
+        st.info("Preencha um titulo, um autor, ou ambos. Quando houver titulo, voce podera confirmar a obra-base antes da recomendacao.")
         return
 
-    with st.spinner("Buscando recomendações..."):
-        data = get_recommendations(title.strip(), author.strip(), filters)
+    current_query = f"{title.strip()}::{author.strip()}"
+    if title.strip() and st.session_state.get("reference_query") != current_query:
+        clear_reference_candidates()
+
+    if submitted:
+        if title.strip():
+            with st.spinner("Buscando obras para confirmar a referencia..."):
+                candidates = search_reference_books(title.strip(), author.strip(), max_results=8)
+            st.session_state["reference_candidates"] = candidates
+            st.session_state["reference_query"] = current_query
+            st.session_state["selected_reference_id"] = ""
+        else:
+            clear_reference_candidates()
+
+    title_for_recommendation = title.strip()
+    author_for_recommendation = author.strip()
+    reference_id_for_recommendation = ""
+
+    if title.strip():
+        candidates = st.session_state.get("reference_candidates", [])
+        if not candidates:
+            st.info("Clique em `Encontrar obra-base` para confirmar qual livro deve ser usado como referencia.")
+            return
+
+        render_section_header(
+            "Referencia",
+            "Confirme a obra correta",
+            "Selecionar explicitamente a obra-base ajuda a evitar ambiguidades entre titulos parecidos, traducoes e edicoes.",
+        )
+        selected_reference = render_reference_shelf(candidates)
+
+        if not selected_reference:
+            st.info("Selecione uma das capas acima para liberar a busca de similares.")
+            return
+
+        render_book_card(selected_reference)
+        search_recommendations = st.button("Buscar recomendacoes com esta obra", type="primary", width="stretch")
+        if not search_recommendations:
+            return
+
+        title_for_recommendation = selected_reference.get("title", "").strip()
+        authors = selected_reference.get("authors", [])
+        author_for_recommendation = (authors[0] if authors else author.strip()).strip()
+        reference_id_for_recommendation = selected_reference.get("id", "").strip()
+    else:
+        search_recommendations = st.button("Buscar recomendacoes", type="primary", width="stretch")
+        if not search_recommendations:
+            st.info("Sem titulo, a curadoria pode partir diretamente do autor informado.")
+            return
+
+    with st.spinner("Buscando recomendacoes..."):
+        data = get_recommendations(
+            title_for_recommendation,
+            author_for_recommendation,
+            filters,
+            reference_id=reference_id_for_recommendation,
+        )
 
     if not data:
         return
@@ -438,16 +624,16 @@ def main() -> None:
     recommendations = data["recommendations"]
 
     render_section_header(
-        "Referência",
+        "Referencia",
         "Obra usada como base",
-        "Esta obra foi escolhida como referência principal para calcular similaridade e ordenar os resultados.",
+        "Esta obra foi confirmada ou escolhida como referencia principal para calcular similaridade e ordenar os resultados.",
     )
     render_book_card(reference)
 
     render_section_header(
         "Resultados",
-        f"{len(recommendations)} recomendações encontradas",
-        "Quando houver autor informado, as obras do proprio autor aparecem primeiro. Depois entram livros de autores similares ordenados pelo score.",
+        f"{len(recommendations)} recomendacoes encontradas",
+        "Os resultados foram ordenados por score de similaridade depois da confirmacao da obra-base.",
     )
 
     if not recommendations:
