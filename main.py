@@ -4,6 +4,7 @@ import os
 import re
 import time
 from collections import OrderedDict
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from typing import Optional
 
 import httpx
@@ -51,6 +52,26 @@ class GoogleBooksUnavailable(Exception):
 
 _google_unavailable_until = 0.0
 _CACHE: "OrderedDict[str, tuple[float, object]]" = OrderedDict()
+
+
+def upgrade_thumbnail_url(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+
+    normalized = url.replace("http://", "https://")
+    if "covers.openlibrary.org" in normalized:
+        return normalized.replace("-S.jpg", "-L.jpg").replace("-M.jpg", "-L.jpg")
+
+    parts = urlsplit(normalized)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query.pop("edge", None)
+    if "zoom" in query:
+        query["zoom"] = "2"
+    elif "books.google." in parts.netloc:
+        query["zoom"] = "2"
+
+    upgraded_query = urlencode(query)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, upgraded_query, parts.fragment))
 
 
 def _cache_get(key: str):
@@ -186,7 +207,9 @@ async def fetch_open_library_search(params: dict) -> list[dict]:
 def parse_open_library_doc(doc: dict) -> Optional[BookResponse]:
     try:
         cover_id = doc.get("cover_i")
-        thumbnail = f"https://covers.openlibrary.org/b/id/{cover_id}-M.jpg" if cover_id else None
+        thumbnail = upgrade_thumbnail_url(
+            f"https://covers.openlibrary.org/b/id/{cover_id}-L.jpg" if cover_id else None
+        )
         subjects = doc.get("subject", []) or []
         language = ""
         if isinstance(doc.get("language"), list) and doc["language"]:
@@ -756,7 +779,7 @@ def parse_book(item: dict) -> Optional[BookResponse]:
             page_count=info.get("pageCount"),
             published_year=year,
             description=info.get("description", "")[:300] if info.get("description") else "",
-            thumbnail=info.get("imageLinks", {}).get("thumbnail"),
+            thumbnail=upgrade_thumbnail_url(info.get("imageLinks", {}).get("thumbnail")),
             language=info.get("language", ""),
         )
     except Exception:

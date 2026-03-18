@@ -1,4 +1,5 @@
 import os
+from html import escape
 
 import httpx
 import streamlit as st
@@ -144,6 +145,39 @@ def apply_page_styles() -> None:
                 margin-bottom: 1rem;
             }
 
+            .book-cover-frame,
+            .reference-cover-frame {
+                width: 100%;
+                aspect-ratio: 2 / 3;
+                overflow: hidden;
+                border-radius: 18px;
+                border: 1px solid rgba(126, 99, 76, 0.16);
+                background:
+                    linear-gradient(180deg, rgba(255, 252, 247, 0.96), rgba(242, 232, 219, 0.88));
+                box-shadow: 0 14px 28px rgba(55, 43, 35, 0.10);
+            }
+
+            .book-cover-frame img,
+            .reference-cover-frame img {
+                width: 100%;
+                height: 100%;
+                object-fit: cover;
+                display: block;
+            }
+
+            .book-cover-empty,
+            .reference-cover-empty {
+                width: 100%;
+                height: 100%;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 1rem;
+                text-align: center;
+                color: rgba(63, 51, 43, 0.72);
+                font-size: 0.84rem;
+            }
+
             .meta-row {
                 display: flex;
                 flex-wrap: wrap;
@@ -186,13 +220,33 @@ def apply_page_styles() -> None:
             }
 
             .reference-choice {
-                min-height: 170px;
+                min-height: 176px;
                 padding: 0.75rem 0.75rem 0.65rem 0.75rem;
                 border-radius: 18px;
                 background: linear-gradient(180deg, rgba(255, 252, 247, 0.96), rgba(242, 232, 219, 0.88));
                 border: 1px solid rgba(126, 99, 76, 0.16);
                 box-shadow: 0 12px 24px rgba(55, 43, 35, 0.08);
                 margin-top: 0.55rem;
+                display: flex;
+                flex-direction: column;
+                gap: 0.32rem;
+            }
+
+            .reference-card-shell {
+                display: flex;
+                flex-direction: column;
+                height: 100%;
+                gap: 0.55rem;
+            }
+
+            .reference-card-body {
+                flex: 1;
+                display: flex;
+                flex-direction: column;
+            }
+
+            .reference-card-action {
+                margin-top: auto;
             }
 
             .reference-choice.is-selected {
@@ -204,13 +258,25 @@ def apply_page_styles() -> None:
                 font-size: 0.96rem;
                 font-weight: 700;
                 color: #3f332b;
-                margin-bottom: 0.35rem;
+                margin-bottom: 0.1rem;
+                min-height: 2.8em;
+                display: -webkit-box;
+                -webkit-box-orient: vertical;
+                -webkit-line-clamp: 2;
+                line-clamp: 2;
+                overflow: hidden;
             }
 
             .reference-choice-meta {
                 font-size: 0.83rem;
                 color: rgba(63, 51, 43, 0.82);
                 line-height: 1.45;
+                min-height: 2.35em;
+                display: -webkit-box;
+                -webkit-box-orient: vertical;
+                -webkit-line-clamp: 2;
+                line-clamp: 2;
+                overflow: hidden;
             }
         </style>
         """,
@@ -248,7 +314,7 @@ def get_recommendations(title: str, author: str, filters: dict, reference_id: st
     except httpx.ReadTimeout:
         st.error(
             "A busca demorou mais do que o esperado. "
-            "Tente novamente ou refine a consulta com tÃ­tulo, autor ou categoria."
+            "Tente novamente ou refine a consulta com título, autor ou categoria."
         )
         return None
 
@@ -283,8 +349,8 @@ def search_reference_books(title: str, author: str = "", max_results: int = 8) -
             )
     except httpx.ConnectError:
         st.error(
-            f"Nao foi possivel conectar ao backend em `{BASE_URL}`. "
-            "Verifique se o FastAPI esta em execucao."
+            f"Não foi possivel conectar ao backend em `{BASE_URL}`. "
+            "Verifique se o FastAPI está em execução."
         )
         return []
     except httpx.ReadTimeout:
@@ -431,10 +497,7 @@ def render_book_card(book: dict, show_score: bool = False, position: int | None 
     image_col, content_col = st.columns([1, 3.2], gap="large")
 
     with image_col:
-        if book.get("thumbnail"):
-            st.image(book["thumbnail"], width="stretch")
-        else:
-            st.caption("Sem capa disponivel")
+        render_cover_image(book, frame_class="book-cover-frame", empty_class="book-cover-empty")
 
     with content_col:
         if position is not None:
@@ -475,10 +538,8 @@ def render_reference_shelf(candidates: list[dict]) -> dict | None:
         selected_id = st.session_state.get("selected_reference_id", "")
         is_selected = selected_id == book.get("id")
         with columns[index % len(columns)]:
-            if book.get("thumbnail"):
-                st.image(book["thumbnail"], width="stretch")
-            else:
-                st.markdown('<div class="reference-choice"><div class="reference-choice-meta">Sem capa disponivel</div></div>', unsafe_allow_html=True)
+            st.markdown('<div class="reference-card-shell">', unsafe_allow_html=True)
+            render_cover_image(book, frame_class="reference-cover-frame", empty_class="reference-cover-empty")
 
             authors = ", ".join(book.get("authors", [])[:2]) or "Autor desconhecido"
             year = book.get("published_year") or "Ano N/A"
@@ -486,15 +547,18 @@ def render_reference_shelf(candidates: list[dict]) -> dict | None:
             selected_class = " is-selected" if is_selected else ""
             st.markdown(
                 f"""
-                <div class="reference-choice{selected_class}">
-                    <div class="reference-choice-title">{book.get("title", "Sem titulo")}</div>
+                <div class="reference-card-body">
+                    <div class="reference-choice{selected_class}">
+                    <div class="reference-choice-title">{book.get("title", "Sem título")}</div>
                     <div class="reference-choice-meta">{authors}</div>
                     <div class="reference-choice-meta">{year}</div>
                     <div class="reference-choice-meta">{categories}</div>
+                    </div>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
+            st.markdown('<div class="reference-card-action">', unsafe_allow_html=True)
             if st.button(
                 "Selecionado" if is_selected else "Selecionar",
                 key=f"select-reference-{book.get('id', index)}",
@@ -503,6 +567,7 @@ def render_reference_shelf(candidates: list[dict]) -> dict | None:
             ):
                 st.session_state["selected_reference_id"] = book.get("id", "")
                 st.rerun()
+            st.markdown("</div></div>", unsafe_allow_html=True)
 
     selected_id = st.session_state.get("selected_reference_id", "")
     if not selected_id:
@@ -513,6 +578,23 @@ def render_reference_shelf(candidates: list[dict]) -> dict | None:
             return book
 
     return None
+
+
+def render_cover_image(book: dict, frame_class: str, empty_class: str) -> None:
+    thumbnail = (book.get("thumbnail") or "").strip()
+    title = escape(book.get("title", "Livro"), quote=True)
+    if thumbnail:
+        safe_thumbnail = escape(thumbnail, quote=True)
+        st.markdown(
+            f'<div class="{frame_class}"><img src="{safe_thumbnail}" alt="Capa de {title}" loading="lazy" referrerpolicy="no-referrer"></div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    st.markdown(
+        f'<div class="{frame_class}"><div class="{empty_class}">Sem capa disponivel</div></div>',
+        unsafe_allow_html=True,
+    )
 
 
 def main() -> None:
@@ -529,7 +611,7 @@ def main() -> None:
     render_section_header(
         "Busca",
         "Escolha e confirme a obra-base",
-        "Quando houver titulo, o fluxo ajuda voce a selecionar a obra correta antes de buscar recomendacoes.",
+        "Quando houver título, o fluxo te ajuda a selecionar a obra correta antes de buscar recomendações.",
     )
 
     if "reference_candidates" not in st.session_state:
@@ -543,7 +625,7 @@ def main() -> None:
         input_col1, input_col2 = st.columns(2, gap="large")
         with input_col1:
             title = st.text_input(
-                "Titulo do livro",
+                "Título do livro",
                 placeholder="Ex.: Duna, 1984, O Hobbit, No Longer Human",
             )
         with input_col2:
@@ -556,7 +638,7 @@ def main() -> None:
         submitted = st.form_submit_button("Encontrar obra-base", width="stretch")
 
     if not title.strip() and not author.strip():
-        st.info("Preencha um titulo, um autor, ou ambos. Quando houver titulo, voce podera confirmar a obra-base antes da recomendacao.")
+        st.info("Preencha um título, um autor, ou ambos. Quando houver título, você podera confirmar a obra-base antes da recomendacao.")
         return
 
     current_query = f"{title.strip()}::{author.strip()}"
@@ -565,7 +647,7 @@ def main() -> None:
 
     if submitted:
         if title.strip():
-            with st.spinner("Buscando obras para confirmar a referencia..."):
+            with st.spinner("Buscando obras para confirmar a referência..."):
                 candidates = search_reference_books(title.strip(), author.strip(), max_results=8)
             st.session_state["reference_candidates"] = candidates
             st.session_state["reference_query"] = current_query
@@ -580,13 +662,13 @@ def main() -> None:
     if title.strip():
         candidates = st.session_state.get("reference_candidates", [])
         if not candidates:
-            st.info("Clique em `Encontrar obra-base` para confirmar qual livro deve ser usado como referencia.")
+            st.info("Clique em `Encontrar obra-base` para confirmar qual livro deve ser usado como referência.")
             return
 
         render_section_header(
-            "Referencia",
+            "Referência",
             "Confirme a obra correta",
-            "Selecionar explicitamente a obra-base ajuda a evitar ambiguidades entre titulos parecidos, traducoes e edicoes.",
+            "Selecionar explicitamente a obra-base ajuda a evitar ambiguidades entre títulos parecidos, traduções e edições.",
         )
         selected_reference = render_reference_shelf(candidates)
 
@@ -595,7 +677,7 @@ def main() -> None:
             return
 
         render_book_card(selected_reference)
-        search_recommendations = st.button("Buscar recomendacoes com esta obra", type="primary", width="stretch")
+        search_recommendations = st.button("Buscar recomendações com esta obra", type="primary", width="stretch")
         if not search_recommendations:
             return
 
@@ -604,12 +686,12 @@ def main() -> None:
         author_for_recommendation = (authors[0] if authors else author.strip()).strip()
         reference_id_for_recommendation = selected_reference.get("id", "").strip()
     else:
-        search_recommendations = st.button("Buscar recomendacoes", type="primary", width="stretch")
+        search_recommendations = st.button("Buscar recomendações", type="primary", width="stretch")
         if not search_recommendations:
-            st.info("Sem titulo, a curadoria pode partir diretamente do autor informado.")
+            st.info("Sem título, a curadoria pode partir diretamente do autor informado.")
             return
 
-    with st.spinner("Buscando recomendacoes..."):
+    with st.spinner("Buscando recomendações..."):
         data = get_recommendations(
             title_for_recommendation,
             author_for_recommendation,
@@ -624,15 +706,15 @@ def main() -> None:
     recommendations = data["recommendations"]
 
     render_section_header(
-        "Referencia",
+        "Referência",
         "Obra usada como base",
-        "Esta obra foi confirmada ou escolhida como referencia principal para calcular similaridade e ordenar os resultados.",
+        "Esta obra foi confirmada ou escolhida como referência principal para calcular similaridade e ordenar os resultados.",
     )
     render_book_card(reference)
 
     render_section_header(
         "Resultados",
-        f"{len(recommendations)} recomendacoes encontradas",
+        f"{len(recommendations)} recomendações encontradas",
         "Os resultados foram ordenados por score de similaridade depois da confirmacao da obra-base.",
     )
 
