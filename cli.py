@@ -600,10 +600,11 @@ def render_cover_image(book: dict, frame_class: str, empty_class: str) -> None:
 def main() -> None:
     st.set_page_config(
         page_title="Book-it Babi",
-        page_icon="./assets/Bit-logo.png",
+        page_icon="./assets/Book-it Babi Logo 2.png",
         layout="wide",
     )
 
+    st.logo("./assets/Book-it Babi Logo 2.png", size='large')
     st.title("Book-it")
     st.caption("Por Babi :)")
     apply_page_styles()
