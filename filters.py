@@ -24,6 +24,34 @@ _GENERIC_CATEGORY_TERMS = {
     "books",
 }
 
+_LANGUAGE_ALIASES = {
+    "pt": "pt",
+    "por": "pt",
+    "pt-br": "pt",
+    "pt-pt": "pt",
+    "en": "en",
+    "eng": "en",
+    "es": "es",
+    "spa": "es",
+    "fr": "fr",
+    "fra": "fr",
+    "fre": "fr",
+    "de": "de",
+    "deu": "de",
+    "ger": "de",
+    "it": "it",
+    "ita": "it",
+    "ja": "ja",
+    "jpn": "ja",
+    "ko": "ko",
+    "kor": "ko",
+    "zh": "zh",
+    "zho": "zh",
+    "chi": "zh",
+    "ru": "ru",
+    "rus": "ru",
+}
+
 # Pesos do scoring
 _WEIGHT_CATEGORY    = 0.24
 _WEIGHT_AUTHOR      = 0.14
@@ -42,6 +70,11 @@ _PENALTY_GENERIC_ONLY = 0.06
 
 def normalize_text(value: Optional[str]) -> str:
     return value.casefold().strip() if value else ""
+
+
+def normalize_language_code(value: Optional[str]) -> str:
+    normalized = normalize_text(value)
+    return _LANGUAGE_ALIASES.get(normalized, normalized)
 
 
 def keywords_from_description(description: str, top_n: int = 3) -> list[str]:
@@ -80,9 +113,15 @@ def category_specificity_score(categories: set[str]) -> float:
 def filter_books(books: list[BookResponse], filters: dict) -> list[BookResponse]:
     """
     Aplica filtros explicitos do usuario.
-    Filtros disponiveis: min_pages, max_pages, min_year, max_year, category, exclude_title.
+    Filtros disponíveis: min_pages, max_pages, min_year, max_year, category, language,
+    exclude_same_author, reference_authors, exclude_title.
     """
     result = []
+    reference_authors = {
+        normalize_text(author)
+        for author in filters.get("reference_authors", [])
+        if author
+    }
 
     for book in books:
         if filters.get("exclude_title"):
@@ -95,6 +134,17 @@ def filter_books(books: list[BookResponse], filters: dict) -> list[BookResponse]
             if requested_category and not any(
                 requested_category in category for category in categories
             ):
+                continue
+
+        if filters.get("language"):
+            requested_language = normalize_language_code(filters["language"])
+            book_language = normalize_language_code(book.language)
+            if requested_language and book_language != requested_language:
+                continue
+
+        if filters.get("exclude_same_author") and reference_authors:
+            candidate_authors = {normalize_text(author) for author in book.authors if author}
+            if candidate_authors and candidate_authors & reference_authors:
                 continue
 
         if filters.get("min_pages") and book.page_count:
@@ -118,26 +168,26 @@ def filter_books(books: list[BookResponse], filters: dict) -> list[BookResponse]
 
 def score_books(books: list[BookResponse], reference: BookResponse) -> list[ScoredBook]:
     """
-    Pontua livros por similaridade com o livro de referencia.
+    Pontua livros por similaridade com o livro de referência.
 
-    Criterios e pesos:
+    Critérios e pesos:
     - Categoria em comum  : 0.24  (Jaccard sobre conjuntos de categorias)
     - Autor em comum      : 0.14  (bonus binario, sem dominar o ranking)
     - Proximidade paginas : 0.10  (diferenca ate 500 paginas, escala linear)
     - Proximidade ano     : 0.08  (diferenca ate 30 anos, escala linear)
     - Idioma igual        : 0.08
-    - Similaridade titulo : 0.18
+    - Similaridade título : 0.18
     - Keywords descricao  : 0.12
     - Categories especificas: 0.06
 
-    Penalidades aplicadas quando metadados estao ausentes no candidato:
+    Penalidades aplicadas quando metadados estão ausentes no candidato:
     - Sem page_count      : -0.08
     - Sem published_year  : -0.04
     - Apenas categorias genericas: -0.06
     """
     ref_cats    = {normalize_text(c) for c in reference.categories}
     ref_authors = {normalize_text(a) for a in reference.authors}
-    ref_language = normalize_text(reference.language)
+    ref_language = normalize_language_code(reference.language)
 
     scored = []
 
@@ -173,10 +223,10 @@ def score_books(books: list[BookResponse], reference: BookResponse) -> list[Scor
             score -= _PENALTY_NO_YEAR
 
         # --- idioma (0.08) ---
-        if ref_language and normalize_text(book.language) == ref_language:
+        if ref_language and normalize_language_code(book.language) == ref_language:
             score += _WEIGHT_LANGUAGE
 
-        # --- titulo (0.18) ---
+        # --- título (0.18) ---
         score += token_similarity(reference.title, book.title) * _WEIGHT_TITLE
 
         # --- descricao (0.12) ---

@@ -11,12 +11,12 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from filters import filter_books, score_books
+from filters import filter_books, normalize_language_code, score_books
 from models import BookResponse, RecommendationResponse
 
 app = FastAPI(
     title="Book Recommender API",
-    description="Recomendacao de livros via Google Books API",
+    description="Recomendação de livros via Google Books API",
     version="0.1.0",
 )
 
@@ -128,7 +128,7 @@ def has_text(value: Optional[str]) -> bool:
 
 async def fetch_google_books(query: str, max_results: int = 20) -> list[dict]:
     if not _google_books_available():
-        raise GoogleBooksUnavailable("Google Books temporariamente indisponivel")
+        raise GoogleBooksUnavailable("Google Books temporariamente indisponível")
 
     params = {
         "q": query,
@@ -161,7 +161,7 @@ async def fetch_google_books(query: str, max_results: int = 20) -> list[dict]:
 
 async def fetch_google_book_by_id(volume_id: str) -> Optional[dict]:
     if not _google_books_available():
-        raise GoogleBooksUnavailable("Google Books temporariamente indisponivel")
+        raise GoogleBooksUnavailable("Google Books temporariamente indisponível")
 
     params = {}
     if API_KEY:
@@ -217,7 +217,7 @@ def parse_open_library_doc(doc: dict) -> Optional[BookResponse]:
 
         return BookResponse(
             id=doc.get("key", ""),
-            title=doc.get("title", "Sem titulo"),
+            title=doc.get("title", "Sem título"),
             authors=doc.get("author_name", []) or [],
             categories=subjects[:6],
             page_count=doc.get("number_of_pages_median"),
@@ -497,8 +497,8 @@ async def fetch_candidate_books(
                 if len(candidates) >= max_results:
                     return candidates
 
-    # fallback: se candidatos insuficientes e temos autor de referencia,
-    # busca por inauthor — garante resultados mesmo sem categories/subjects
+    # fallback: se candidatos insuficientes e temos autor de referência,
+    # busca por inauthor - garante resultados mesmo sem categories/subjects
     if len(candidates) < 5 and reference and reference.authors:
         author = reference.authors[0]
         items = await fetch_google_books(f'inauthor:"{author}"', max_results=20)
@@ -640,8 +640,8 @@ async def root():
 
 @app.get("/search", response_model=list[BookResponse])
 async def search_books(
-    q: str = Query(..., description="Titulo ou termo de busca"),
-    author: Optional[str] = Query(None, description="Autor opcional para refinar a referencia"),
+    q: str = Query(..., description="Título ou termo de busca"),
+    author: Optional[str] = Query(None, description="Autor opcional para refinar a referência"),
     max_results: int = Query(10, ge=1, le=40),
 ):
     try:
@@ -680,20 +680,22 @@ async def search_books(
 
 @app.get("/recommend", response_model=RecommendationResponse)
 async def recommend_books(
-    q: Optional[str] = Query(None, description="Titulo de referencia para recomendacao"),
+    q: Optional[str] = Query(None, description="Título de referência para recomendação"),
     author: Optional[str] = Query(None, description="Autor para priorizar obras relacionadas"),
-    reference_id: Optional[str] = Query(None, description="Id explicito da obra-base selecionada"),
+    reference_id: Optional[str] = Query(None, description="Id explícito da obra-base selecionada"),
     min_pages: Optional[int] = Query(None, ge=1),
     max_pages: Optional[int] = Query(None, ge=1),
     min_year: Optional[int] = Query(None, ge=1000, le=2100),
     max_year: Optional[int] = Query(None, ge=1000, le=2100),
-    category: Optional[str] = Query(None, description="Genero/categoria desejada"),
+    category: Optional[str] = Query(None, description="Gênero/categoria desejada"),
+    language: Optional[str] = Query(None, description="Idioma desejado"),
+    exclude_same_author: bool = Query(False, description="Ignora obras do mesmo autor"),
     limit: int = Query(5, ge=1, le=20),
 ):
     if not has_text(q) and not has_text(author) and not has_text(reference_id):
         raise HTTPException(
             status_code=422,
-            detail="Informe pelo menos um titulo ou autor para recomendar livros",
+            detail="Informe pelo menos um título ou autor para recomendar livros",
         )
 
     google_available = True
@@ -726,7 +728,7 @@ async def recommend_books(
     if not reference:
         raise HTTPException(
             status_code=404,
-            detail="Nao foi possivel localizar uma obra de referencia",
+            detail="Não foi possível localizar uma obra de referência",
         )
 
     enriched_subjects = await fetch_open_library_subjects(
@@ -756,6 +758,9 @@ async def recommend_books(
         "min_year": min_year,
         "max_year": max_year,
         "category": normalize_text(category),
+        "language": normalize_language_code(language),
+        "exclude_same_author": exclude_same_author,
+        "reference_authors": reference.authors,
         "exclude_title": reference.title,
     }
     filtered = filter_books(candidates, filters)
@@ -773,7 +778,7 @@ def parse_book(item: dict) -> Optional[BookResponse]:
 
         return BookResponse(
             id=item.get("id", ""),
-            title=info.get("title", "Sem titulo"),
+            title=info.get("title", "Sem título"),
             authors=info.get("authors", []),
             categories=info.get("categories", []),
             page_count=info.get("pageCount"),
@@ -788,8 +793,8 @@ def parse_book(item: dict) -> Optional[BookResponse]:
 
 def _title_similarity(a: str, b: str) -> float:
     """
-    Retorna score de similaridade entre dois titulos normalizados (0.0 a 1.0).
-    Usa Jaccard sobre tokens para lidar com traducoes parciais e abreviacoes.
+    Retorna score de similaridade entre dois títulos normalizados (0.0 a 1.0).
+    Usa Jaccard sobre tokens para lidar com traduções parciais e abreviações.
     Exemplos:
       "duna" vs "dune"                           -> 0.0  (tokens diferentes)
       "1984" vs "nineteen eighty-four"           -> 0.0  (sem token comum)
@@ -806,16 +811,16 @@ def _title_similarity(a: str, b: str) -> float:
 
 def _reference_score(item: dict, query: str) -> float:
     """
-    Pontua um candidato a livro de referencia.
+    Pontua um candidato a livro de referência.
 
-    Criterios:
-    - Titulo exato                    : +10.0
+    Critérios:
+    - Título exato                    : +10.0
     - Similaridade de tokens (Jaccard): +0 a +6.0
     - Tem description preenchida      : +3.0  (proxy de obra relevante)
     - Tem pageCount                   : +2.0
     - Tem thumbnail                   : +1.0
     - averageRating da API            : +0 a +1.0 (normalizado por 5.0)
-    - ratingsCount deliberadamente EXCLUIDO — enviesado por docs governamentais
+    - ratingsCount deliberadamente EXCLUÍDO - enviesado por docs governamentais
     """
     info   = item.get("volumeInfo", {})
     title  = info.get("title", "")
@@ -844,27 +849,27 @@ def _reference_score(item: dict, query: str) -> float:
 
 async def pick_best_reference(query: str) -> Optional[BookResponse]:
     """
-    Busca o livro de referencia usando duas estrategias complementares:
+    Busca o livro de referência usando duas estratégias complementares:
 
-    1. intitle:"query" — restringe a API a titulos que contenham o termo exato,
+    1. intitle:"query" - restringe a API a títulos que contenham o termo exato,
        reduzindo drasticamente falsos positivos como documentos governamentais
-       ou periodicos academicos.
-    2. query livre — fallback caso intitle nao retorne resultados uteis.
+       ou periódicos acadêmicos.
+    2. query livre - fallback caso intitle não retorne resultados úteis.
 
     Dentre todos os candidatos coletados, escolhe o melhor pelo _reference_score,
-    que prioriza correspondencia de titulo e presenca de metadados (description,
-    pageCount), sem usar ratingsCount que e enviesado.
+    que prioriza correspondência de título e presença de metadados (description,
+    pageCount), sem usar ratingsCount, que é enviesado.
     """
     all_items: list[dict] = []
 
-    # estrategia 1: intitle restringe bem
+    # estratégia 1: intitle restringe bem
     try:
         intitle_items = await fetch_google_books(f'intitle:"{query.strip()}"', max_results=10)
         all_items.extend(intitle_items)
     except GoogleBooksUnavailable:
         pass
 
-    # estrategia 2: busca livre como complemento
+    # estratégia 2: busca livre como complemento
     try:
         free_items = await fetch_google_books(query.strip(), max_results=10)
         seen_ids = {item.get("id") for item in all_items}

@@ -15,7 +15,7 @@ class BookResponse(BaseModel):
 
 
 class ScoredBook(BookResponse):
-    score: float  # 0.0 a 1.0 — similaridade com o livro de referência
+    score: float  # 0.0 a 1.0 - similaridade com o livro de referência
 
 
 class RecommendationResponse(BaseModel):

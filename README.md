@@ -10,7 +10,7 @@ O fluxo atual do app foi desenhado para reduzir ambiguidades:
 
 1. o usuário pesquisa um título
 2. o app mostra sugestões de obras-base
-3. a obra correta e selecionada visualmente
+3. a obra correta é selecionada visualmente
 4. a recomendação usa o `id` da obra escolhida
 5. resultados repetidos por edições muito parecidas são deduplicados
 
@@ -27,7 +27,7 @@ O fluxo atual do app foi desenhado para reduzir ambiguidades:
 
 - Python 3.10+
 
-Dependencias atuais em [`requirements.txt`](.\requirements.txt):
+Dependências atuais em [`requirements.txt`](.\requirements.txt):
 
 - `fastapi`
 - `uvicorn`
@@ -70,7 +70,7 @@ Ajustes úteis:
   Score mínimo para um livro entrar nas recomendações.
   Padrão: `0.18`
 - `BOOKIT_MAX_SEARCH_TERMS`
-  Quantidade máxima de termos tematicos usados na busca de candidatos.
+  Quantidade máxima de termos temáticos usados na busca de candidatos.
   Padrão: `4`
 
 Sem chave de API o servidor ainda funciona, mas o limite do Google Books tende a ser menor.
@@ -103,7 +103,7 @@ Se o usuário informar apenas autor, o app ainda permite partir diretamente dess
 
 ### `GET /`
 
-Health simples do servico.
+Health simples do serviço.
 
 ### `GET /search`
 
@@ -147,7 +147,7 @@ GET /recommend?q=1984&author=George%20Orwell&limit=5
 
 ### `GET /health`
 
-Retorna status basico da API e informa se a chave do Google Books esta configurada.
+Retorna status básico da API e informa se a chave do Google Books está configurada.
 
 ## Estrutura do projeto
 
@@ -167,7 +167,7 @@ De forma resumida:
 
 1. resolve a obra-base a partir do `reference_id` selecionado ou por busca assistida
 2. enriquece subjects/categorias da referência
-3. busca candidatos tematicos em Google Books ou Open Library
+3. busca candidatos temáticos em Google Books ou Open Library
 4. remove duplicatas e edições muito parecidas
 5. aplica filtros do usuário
 6. calcula score de similaridade
@@ -188,4 +188,4 @@ Sinais usados no score:
 
 - a seleção guiada melhora bastante consultas vagas, mas ainda depende da qualidade dos metadados das APIs externas
 - ids do Google Books tendem a ser resolvidos com mais precisão do que ids do Open Library
-- recomendações podem variar conforme disponibilidade e metadata retornada pelas APIs externas
+- recomendações podem variar conforme disponibilidade e metadados retornados pelas APIs externas

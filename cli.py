@@ -25,6 +25,145 @@ COMMON_GENRES = [
     "Psychology",
     "Poetry",
 ]
+LANGUAGE_OPTIONS = {
+    "": "Qualquer idioma",
+    "pt": "Português",
+    "en": "Inglês",
+    "es": "Espanhol",
+    "fr": "Francês",
+    "de": "Alemão",
+    "it": "Italiano",
+    "ja": "Japonês",
+    "ko": "Coreano",
+    "zh": "Chinês",
+    "ru": "Russo",
+}
+DECADE_OPTIONS = {
+    "": "Qualquer década",
+    "2020": "Anos 2020",
+    "2010": "Anos 2010",
+    "2000": "Anos 2000",
+    "1990": "Anos 1990",
+    "1980": "Anos 1980",
+    "1970": "Anos 1970",
+    "1960": "Anos 1960",
+    "1950": "Anos 1950",
+    "1940": "Anos 1940",
+    "1930": "Anos 1930",
+    "1920": "Anos 1920",
+    "1910": "Anos 1910",
+    "1900": "Anos 1900",
+    "pre-1900": "Antes de 1900",
+}
+PAGE_RANGE_MIN = 0
+PAGE_RANGE_MAX = 1500
+PAGE_RANGE_STEP = 100
+
+
+def format_language_label(language_code: str | None) -> str:
+    if not language_code:
+        return "N/A"
+    normalized = language_code.strip().casefold()
+    aliases = {
+        "por": "pt",
+        "pt-br": "pt",
+        "pt-pt": "pt",
+        "eng": "en",
+        "spa": "es",
+        "fra": "fr",
+        "fre": "fr",
+        "deu": "de",
+        "ger": "de",
+        "ita": "it",
+        "jpn": "ja",
+        "kor": "ko",
+        "zho": "zh",
+        "chi": "zh",
+        "rus": "ru",
+    }
+    canonical = aliases.get(normalized, normalized)
+    return LANGUAGE_OPTIONS.get(canonical, canonical.upper())
+
+
+def format_pages_label(book: dict) -> str:
+    pages = book.get("page_count")
+    return f"{pages} páginas" if pages else "Páginas N/A"
+
+
+def format_year_label(book: dict) -> str:
+    year = book.get("published_year")
+    return str(year) if year else "Ano N/A"
+
+
+def decade_to_year_bounds(decade: str) -> tuple[int | None, int | None]:
+    if not decade:
+        return None, None
+    if decade == "pre-1900":
+        return None, 1899
+
+    decade_start = int(decade)
+    return decade_start, decade_start + 9
+
+
+def format_page_range_value(value: int) -> str:
+    if value <= PAGE_RANGE_MIN:
+        return "0"
+    if value >= PAGE_RANGE_MAX:
+        return f"{PAGE_RANGE_MAX}+"
+    return str(value)
+
+
+def get_active_filter_labels(filters: dict) -> list[str]:
+    labels: list[str] = []
+    if filters.get("category"):
+        labels.append(f"Gênero: {filters['category']}")
+    if filters.get("language"):
+        labels.append(f"Idioma: {format_language_label(filters['language'])}")
+    if filters.get("min_pages") or filters.get("max_pages"):
+        page_start = filters.get("min_pages") or PAGE_RANGE_MIN
+        page_end = filters.get("max_pages") or PAGE_RANGE_MAX
+        labels.append(f"Tamanho: {format_page_range_value(page_start)}-{format_page_range_value(page_end)} páginas")
+    if filters.get("decade"):
+        labels.append(f"Década: {DECADE_OPTIONS.get(filters['decade'], filters['decade'])}")
+    if filters.get("exclude_same_author"):
+        labels.append("Sem obras do mesmo autor")
+    if filters.get("limit"):
+        labels.append(f"{filters['limit']} recomendações")
+    return labels
+
+
+def build_match_reasons(book: dict, reference: dict | None = None) -> list[str]:
+    reasons: list[str] = []
+    if not reference:
+        return reasons
+
+    reference_categories = {category.casefold() for category in reference.get("categories", []) if category}
+    book_categories = {category.casefold() for category in book.get("categories", []) if category}
+    if reference_categories and book_categories and reference_categories & book_categories:
+        reasons.append("Compartilha gênero com a obra-base")
+
+    reference_authors = {author.casefold() for author in reference.get("authors", []) if author}
+    book_authors = {author.casefold() for author in book.get("authors", []) if author}
+    if reference_authors and book_authors and reference_authors & book_authors:
+        reasons.append("Mesmo autor")
+
+    if reference.get("language") and book.get("language"):
+        if format_language_label(reference.get("language")) == format_language_label(book.get("language")):
+            reasons.append(f"Mesmo idioma: {format_language_label(book.get('language'))}")
+
+    if reference.get("published_year") and book.get("published_year"):
+        difference = abs(reference["published_year"] - book["published_year"])
+        if difference <= 5:
+            reasons.append("Período muito próximo")
+        elif difference <= 15:
+            reasons.append("Período semelhante")
+
+    if reference.get("page_count") and book.get("page_count"):
+        difference = abs(reference["page_count"] - book["page_count"])
+        if difference <= 80:
+            reasons.append("Extensão parecida")
+
+    return reasons[:3]
 
 
 def apply_page_styles() -> None:
@@ -205,6 +344,38 @@ def apply_page_styles() -> None:
                 font-weight: 700;
             }
 
+            .filter-summary {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 0.5rem;
+                margin: 0.15rem 0 1rem 0;
+            }
+
+            .filter-chip {
+                padding: 0.34rem 0.7rem;
+                border-radius: 999px;
+                background: rgba(128, 89, 43, 0.10);
+                border: 1px solid rgba(128, 89, 43, 0.14);
+                color: #6e4d2c;
+                font-size: 0.82rem;
+            }
+
+            .insight-row {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 0.42rem;
+                margin: 0 0 0.8rem 0;
+            }
+
+            .insight-pill {
+                padding: 0.28rem 0.62rem;
+                border-radius: 999px;
+                background: rgba(182, 133, 72, 0.10);
+                border: 1px solid rgba(182, 133, 72, 0.15);
+                color: #8b5d24;
+                font-size: 0.78rem;
+            }
+
             div[data-testid="stExpander"] {
                 border: 1px solid rgba(126, 99, 76, 0.16);
                 border-radius: 18px;
@@ -307,7 +478,7 @@ def get_recommendations(title: str, author: str, filters: dict, reference_id: st
             response = client.get(f"{BASE_URL}/recommend", params=params)
     except httpx.ConnectError:
         st.error(
-            f"Não foi possivel conectar ao backend em `{BASE_URL}`. "
+            f"Não foi possível conectar ao backend em `{BASE_URL}`. "
             "Verifique se o FastAPI está em execução."
         )
         return None
@@ -349,7 +520,7 @@ def search_reference_books(title: str, author: str = "", max_results: int = 8) -
             )
     except httpx.ConnectError:
         st.error(
-            f"Não foi possivel conectar ao backend em `{BASE_URL}`. "
+            f"Não foi possível conectar ao backend em `{BASE_URL}`. "
             "Verifique se o FastAPI está em execução."
         )
         return []
@@ -422,9 +593,21 @@ def render_section_header(kicker: str, title: str, copy: str) -> None:
     )
 
 
+def render_filter_summary(filters: dict) -> None:
+    labels = get_active_filter_labels(filters)
+    if not labels:
+        return
+
+    chips = "".join(f'<div class="filter-chip">{escape(label)}</div>' for label in labels)
+    st.markdown(
+        f'<div class="filter-summary">{chips}</div>',
+        unsafe_allow_html=True,
+    )
+
+
 def build_filters() -> dict:
     with st.expander("Filtros de recomendação", expanded=False):
-        st.caption("Use 0 para ignorar filtros numéricos.")
+        st.caption("Ajuste idioma, década, faixa de páginas e afinidade com o autor.")
 
         top_left, top_right = st.columns([1.6, 1], gap="large")
         with top_left:
@@ -450,49 +633,58 @@ def build_filters() -> dict:
 
         col1, col2 = st.columns(2, gap="large")
         with col1:
-            min_pages = st.number_input(
-                "Páginas mínimas",
-                min_value=0,
-                value=0,
-                step=10,
-                help="Aceita digitação manual ou incrementos de 10 páginas.",
+            selected_language = st.selectbox(
+                "Idioma",
+                options=list(LANGUAGE_OPTIONS.keys()),
+                format_func=lambda code: LANGUAGE_OPTIONS[code],
+                index=0,
+                help="Filtra os resultados para o idioma escolhido.",
             )
-            min_year = st.number_input(
-                "Ano mínimo",
-                min_value=0,
-                value=0,
-                step=10,
-                help="Aceita digitação manual ou incrementos de 10 anos.",
+            selected_decade = st.selectbox(
+                "Década preferida",
+                options=list(DECADE_OPTIONS.keys()),
+                format_func=lambda value: DECADE_OPTIONS[value],
+                index=0,
+                help="Prefira obras publicadas em uma década específica.",
+            )
+            exclude_same_author = st.checkbox(
+                "Ignorar obras do mesmo autor",
+                value=False,
+                help="Evita que as recomendações sejam dominadas por outros livros do mesmo autor.",
             )
         with col2:
-            max_pages = st.number_input(
-                "Páginas máximas",
-                min_value=0,
-                value=0,
-                step=10,
-                help="Aceita digitação manual ou incrementos de 10 páginas.",
-            )
-            max_year = st.number_input(
-                "Ano máximo",
-                min_value=0,
-                value=0,
-                step=10,
-                help="Aceita digitação manual ou incrementos de 10 anos.",
+            page_range = st.select_slider(
+                "Quantidade de páginas",
+                options=list(range(PAGE_RANGE_MIN, PAGE_RANGE_MAX + PAGE_RANGE_STEP, PAGE_RANGE_STEP)),
+                value=(PAGE_RANGE_MIN, PAGE_RANGE_MAX),
+                format_func=format_page_range_value,
+                help="Refine a extensão das obras em passos de 100 páginas.",
             )
 
     genre = custom_genre.strip() or selected_genre.strip()
+    min_year, max_year = decade_to_year_bounds(selected_decade)
+    min_pages = page_range[0] if page_range[0] > PAGE_RANGE_MIN else None
+    max_pages = page_range[1] if page_range[1] < PAGE_RANGE_MAX else None
 
     return {
-        "min_pages": normalize_optional_number(min_pages),
-        "max_pages": normalize_optional_number(max_pages),
-        "min_year": normalize_optional_number(min_year),
-        "max_year": normalize_optional_number(max_year),
+        "min_pages": min_pages,
+        "max_pages": max_pages,
+        "min_year": min_year,
+        "max_year": max_year,
+        "decade": selected_decade or None,
         "category": genre or None,
+        "language": selected_language or None,
+        "exclude_same_author": exclude_same_author,
         "limit": int(limit),
     }
 
 
-def render_book_card(book: dict, show_score: bool = False, position: int | None = None) -> None:
+def render_book_card(
+    book: dict,
+    show_score: bool = False,
+    position: int | None = None,
+    reference: dict | None = None,
+) -> None:
     st.markdown('<div class="result-card">', unsafe_allow_html=True)
     image_col, content_col = st.columns([1, 3.2], gap="large")
 
@@ -508,21 +700,28 @@ def render_book_card(book: dict, show_score: bool = False, position: int | None 
                 unsafe_allow_html=True,
             )
         st.subheader(book["title"])
+        reasons = build_match_reasons(book, reference=reference)
+        if reasons:
+            reason_chips = "".join(f'<div class="insight-pill">{escape(reason)}</div>' for reason in reasons)
+            st.markdown(f'<div class="insight-row">{reason_chips}</div>', unsafe_allow_html=True)
         authors = ", ".join(book.get("authors", [])) or "Desconhecido"
         categories = ", ".join(book.get("categories", [])) or "N/A"
+        language = format_language_label(book.get("language"))
         st.markdown(
             f"""
             <div class="meta-row">
                 <div class="meta-pill">Autores: {authors}</div>
                 <div class="meta-pill">Gênero: {categories}</div>
-                <div class="meta-pill">Páginas: {book.get("page_count") or "N/A"}</div>
-                <div class="meta-pill">Ano: {book.get("published_year") or "N/A"}</div>
+                <div class="meta-pill">Idioma: {language}</div>
+                <div class="meta-pill">{format_pages_label(book)}</div>
+                <div class="meta-pill">{format_year_label(book)}</div>
             </div>
             """,
             unsafe_allow_html=True,
         )
         if book.get("description"):
-            st.write(book["description"])
+            with st.expander("Ver descrição"):
+                st.write(book["description"])
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -542,8 +741,9 @@ def render_reference_shelf(candidates: list[dict]) -> dict | None:
             render_cover_image(book, frame_class="reference-cover-frame", empty_class="reference-cover-empty")
 
             authors = ", ".join(book.get("authors", [])[:2]) or "Autor desconhecido"
-            year = book.get("published_year") or "Ano N/A"
-            categories = ", ".join(book.get("categories", [])[:2]) or "Genero N/A"
+            year = format_year_label(book)
+            categories = ", ".join(book.get("categories", [])[:2]) or "Gênero N/A"
+            language = format_language_label(book.get("language"))
             selected_class = " is-selected" if is_selected else ""
             st.markdown(
                 f"""
@@ -553,6 +753,7 @@ def render_reference_shelf(candidates: list[dict]) -> dict | None:
                     <div class="reference-choice-meta">{authors}</div>
                     <div class="reference-choice-meta">{year}</div>
                     <div class="reference-choice-meta">{categories}</div>
+                    <div class="reference-choice-meta">Idioma: {language}</div>
                     </div>
                 </div>
                 """,
@@ -592,7 +793,7 @@ def render_cover_image(book: dict, frame_class: str, empty_class: str) -> None:
         return
 
     st.markdown(
-        f'<div class="{frame_class}"><div class="{empty_class}">Sem capa disponivel</div></div>',
+        f'<div class="{frame_class}"><div class="{empty_class}">Sem capa disponível</div></div>',
         unsafe_allow_html=True,
     )
 
@@ -609,6 +810,7 @@ def main() -> None:
     st.caption("Por Babi :)")
     apply_page_styles()
     render_intro()
+    recommendations: list[dict] = []
     render_section_header(
         "Busca",
         "Escolha e confirme a obra-base",
@@ -638,8 +840,10 @@ def main() -> None:
         filters = build_filters()
         submitted = st.form_submit_button("Encontrar obra-base", width="stretch")
 
+    render_filter_summary(filters)
+
     if not title.strip() and not author.strip():
-        st.info("Preencha um título, um autor, ou ambos. Quando houver título, você podera confirmar a obra-base antes da recomendacao.")
+        st.info("Preencha um título, um autor, ou ambos. Se houver título, você poderá confirmar a obra-base antes de gerar recomendações.")
         return
 
     current_query = f"{title.strip()}::{author.strip()}"
@@ -672,12 +876,14 @@ def main() -> None:
             "Selecionar explicitamente a obra-base ajuda a evitar ambiguidades entre títulos parecidos, traduções e edições.",
         )
         selected_reference = render_reference_shelf(candidates)
-
         if not selected_reference:
-            st.info("Selecione uma das capas acima para liberar a busca de similares.")
+            st.info("Selecione uma das opções acima para destravar as recomendações e reduzir ambiguidades entre edições, traduções e obras com nomes parecidos.")
             return
 
-        render_book_card(selected_reference)
+        st.success(
+            f'Obra-base selecionada: "{selected_reference.get("title", "Sem título")}". '
+            "Agora você já pode buscar as recomendações."
+        )
         search_recommendations = st.button("Buscar recomendações com esta obra", type="primary", width="stretch")
         if not search_recommendations:
             return
@@ -706,6 +912,8 @@ def main() -> None:
     reference = data["reference"]
     recommendations = data["recommendations"]
 
+    render_filter_summary(filters)
+
     render_section_header(
         "Referência",
         "Obra usada como base",
@@ -716,7 +924,7 @@ def main() -> None:
     render_section_header(
         "Resultados",
         f"{len(recommendations)} recomendações encontradas",
-        "Os resultados foram ordenados por score de similaridade depois da confirmacao da obra-base.",
+        "Os resultados foram ordenados por score de similaridade depois da confirmação da obra-base.",
     )
 
     if not recommendations:
@@ -724,7 +932,7 @@ def main() -> None:
         return
 
     for index, book in enumerate(recommendations, start=1):
-        render_book_card(book, show_score=True, position=index)
+        render_book_card(book, show_score=True, position=index, reference=reference)
 
 
 if __name__ == "__main__":
