@@ -1,6 +1,8 @@
 import re
 from typing import Optional
 
+from book_profile import extract_book_profile, profile_component_scores
+from metadata_normalizer import normalize_language_code, normalize_text
 from models import BookResponse, ScoredBook
 
 # Stopwords PT + EN para extração de keywords da descrição
@@ -24,34 +26,6 @@ _GENERIC_CATEGORY_TERMS = {
     "books",
 }
 
-_LANGUAGE_ALIASES = {
-    "pt": "pt",
-    "por": "pt",
-    "pt-br": "pt",
-    "pt-pt": "pt",
-    "en": "en",
-    "eng": "en",
-    "es": "es",
-    "spa": "es",
-    "fr": "fr",
-    "fra": "fr",
-    "fre": "fr",
-    "de": "de",
-    "deu": "de",
-    "ger": "de",
-    "it": "it",
-    "ita": "it",
-    "ja": "ja",
-    "jpn": "ja",
-    "ko": "ko",
-    "kor": "ko",
-    "zh": "zh",
-    "zho": "zh",
-    "chi": "zh",
-    "ru": "ru",
-    "rus": "ru",
-}
-
 # Pesos do scoring
 _WEIGHT_CATEGORY    = 0.24
 _WEIGHT_AUTHOR      = 0.14
@@ -61,20 +35,22 @@ _WEIGHT_LANGUAGE    = 0.08
 _WEIGHT_TITLE       = 0.18
 _WEIGHT_DESCRIPTION = 0.12
 _WEIGHT_SPECIFICITY = 0.06
+_WEIGHT_THEME       = 0.20
 
 # Penalidades por metadados ausentes
 _PENALTY_NO_PAGES = 0.08
 _PENALTY_NO_YEAR  = 0.04
 _PENALTY_GENERIC_ONLY = 0.06
 
-
-def normalize_text(value: Optional[str]) -> str:
-    return value.casefold().strip() if value else ""
-
-
-def normalize_language_code(value: Optional[str]) -> str:
-    normalized = normalize_text(value)
-    return _LANGUAGE_ALIASES.get(normalized, normalized)
+_PROFILE_COMPONENT_WEIGHTS = {
+    "themes": 0.36,
+    "narrative_markers": 0.18,
+    "category_kinds": 0.18,
+    "tones": 0.10,
+    "audiences": 0.08,
+    "pace_markers": 0.04,
+    "keywords": 0.06,
+}
 
 
 def keywords_from_description(description: str, top_n: int = 3) -> list[str]:
@@ -108,6 +84,50 @@ def category_specificity_score(categories: set[str]) -> float:
         return 0.0
     specific = [category for category in categories if category not in _GENERIC_CATEGORY_TERMS]
     return len(specific) / len(categories)
+
+
+def _profile_signal_strength(profile) -> float:
+    components = [
+        profile.themes,
+        profile.tones,
+        profile.narrative_markers,
+        profile.category_kinds,
+        profile.audiences,
+        profile.pace_markers,
+        profile.keywords,
+    ]
+    total_labels = sum(len(component) for component in components)
+    return min(total_labels / 14, 1.0)
+
+
+def _dynamic_profile_weight(
+    reference_category_specificity: float,
+    candidate_category_specificity: float,
+    description_overlap: float,
+    reference_profile_strength: float,
+    candidate_profile_strength: float,
+) -> float:
+    weight = _WEIGHT_THEME
+
+    average_specificity = (reference_category_specificity + candidate_category_specificity) / 2
+    average_profile_strength = (reference_profile_strength + candidate_profile_strength) / 2
+
+    if average_specificity < 0.35:
+        weight += 0.04
+    if average_profile_strength >= 0.45:
+        weight += 0.03
+    if description_overlap >= 0.20:
+        weight += 0.02
+
+    return min(weight, 0.30)
+
+
+def _compute_profile_score(reference_profile, candidate_profile) -> float:
+    component_scores = profile_component_scores(reference_profile, candidate_profile)
+    return sum(
+        component_scores[name] * weight
+        for name, weight in _PROFILE_COMPONENT_WEIGHTS.items()
+    )
 
 
 def filter_books(books: list[BookResponse], filters: dict) -> list[BookResponse]:
@@ -179,6 +199,7 @@ def score_books(books: list[BookResponse], reference: BookResponse) -> list[Scor
     - Similaridade título : 0.18
     - Keywords descricao  : 0.12
     - Categories especificas: 0.06
+    - Perfil tematico     : 0.20
 
     Penalidades aplicadas quando metadados estão ausentes no candidato:
     - Sem page_count      : -0.08
@@ -188,6 +209,9 @@ def score_books(books: list[BookResponse], reference: BookResponse) -> list[Scor
     ref_cats    = {normalize_text(c) for c in reference.categories}
     ref_authors = {normalize_text(a) for a in reference.authors}
     ref_language = normalize_language_code(reference.language)
+    reference_profile = extract_book_profile(reference)
+    reference_category_specificity = category_specificity_score(ref_cats)
+    reference_profile_strength = _profile_signal_strength(reference_profile)
 
     scored = []
 
@@ -230,13 +254,26 @@ def score_books(books: list[BookResponse], reference: BookResponse) -> list[Scor
         score += token_similarity(reference.title, book.title) * _WEIGHT_TITLE
 
         # --- descricao (0.12) ---
-        score += keyword_overlap_score(reference, book) * _WEIGHT_DESCRIPTION
+        description_overlap = keyword_overlap_score(reference, book)
+        score += description_overlap * _WEIGHT_DESCRIPTION
 
         # --- especificidade de categorias (0.06) ---
         specificity = category_specificity_score(book_cats)
         score += specificity * _WEIGHT_SPECIFICITY
         if book_cats and specificity == 0.0:
             score -= _PENALTY_GENERIC_ONLY
+
+        # --- semantic profile (dynamic weight) ---
+        candidate_profile = extract_book_profile(book)
+        candidate_profile_strength = _profile_signal_strength(candidate_profile)
+        profile_weight = _dynamic_profile_weight(
+            reference_category_specificity=reference_category_specificity,
+            candidate_category_specificity=specificity,
+            description_overlap=description_overlap,
+            reference_profile_strength=reference_profile_strength,
+            candidate_profile_strength=candidate_profile_strength,
+        )
+        score += _compute_profile_score(reference_profile, candidate_profile) * profile_weight
 
         scored.append(ScoredBook(**book.model_dump(), score=round(max(0.0, score), 4)))
 

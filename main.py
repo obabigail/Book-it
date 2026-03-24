@@ -4,6 +4,7 @@ import os
 import re
 import time
 from collections import OrderedDict
+from html import unescape
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from typing import Optional
 
@@ -35,6 +36,10 @@ CACHE_MAX_ITEMS = int(os.getenv("BOOKIT_CACHE_MAX_ITEMS", "512"))
 GOOGLE_COOLDOWN_SECONDS = int(os.getenv("BOOKIT_GOOGLE_COOLDOWN_SECONDS", "900"))
 MIN_RECOMMENDATION_SCORE = float(os.getenv("BOOKIT_MIN_RECOMMENDATION_SCORE", "0.18"))
 MAX_SEARCH_TERMS = int(os.getenv("BOOKIT_MAX_SEARCH_TERMS", "4"))
+COVER_FETCH_TIMEOUT_SECONDS = float(os.getenv("BOOKIT_COVER_FETCH_TIMEOUT_SECONDS", "8"))
+MAX_CONCURRENT_COVER_TASKS = int(os.getenv("BOOKIT_MAX_CONCURRENT_COVER_TASKS", "4"))
+MAX_CONCURRENT_PROVIDER_CALLS = int(os.getenv("BOOKIT_MAX_CONCURRENT_PROVIDER_CALLS", "6"))
+HTTP_SSL_VERIFY = os.getenv("BOOKIT_HTTP_SSL_VERIFY", "true").strip().lower() not in {"0", "false", "no", "off"}
 GENERIC_SUBJECTS = {
     "fiction",
     "ficcao",
@@ -52,6 +57,22 @@ class GoogleBooksUnavailable(Exception):
 
 _google_unavailable_until = 0.0
 _CACHE: "OrderedDict[str, tuple[float, object]]" = OrderedDict()
+_COVER_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_COVER_TASKS)
+_PROVIDER_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_PROVIDER_CALLS)
+
+
+def _build_async_client(
+    *,
+    timeout: float,
+    headers: Optional[dict] = None,
+    follow_redirects: bool = False,
+) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        timeout=timeout,
+        headers=headers,
+        follow_redirects=follow_redirects,
+        verify=HTTP_SSL_VERIFY,
+    )
 
 
 def upgrade_thumbnail_url(url: Optional[str]) -> Optional[str]:
@@ -72,6 +93,38 @@ def upgrade_thumbnail_url(url: Optional[str]) -> Optional[str]:
 
     upgraded_query = urlencode(query)
     return urlunsplit((parts.scheme, parts.netloc, parts.path, upgraded_query, parts.fragment))
+
+
+def build_open_library_cover_url(identifier_type: str, identifier: str) -> Optional[str]:
+    cleaned_identifier = (identifier or "").strip()
+    if not cleaned_identifier:
+        return None
+
+    return upgrade_thumbnail_url(
+        f"https://covers.openlibrary.org/b/{identifier_type}/{cleaned_identifier}-L.jpg?default=false"
+    )
+
+
+def _google_thumbnail_candidates(volume_info: dict) -> list[str]:
+    image_links = volume_info.get("imageLinks", {}) or {}
+    ordered_keys = [
+        "extraLarge",
+        "large",
+        "medium",
+        "small",
+        "thumbnail",
+        "smallThumbnail",
+    ]
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    for key in ordered_keys:
+        upgraded = upgrade_thumbnail_url(image_links.get(key))
+        if upgraded and upgraded not in seen:
+            seen.add(upgraded)
+            candidates.append(upgraded)
+
+    return candidates
 
 
 def _cache_get(key: str):
@@ -126,6 +179,71 @@ def has_text(value: Optional[str]) -> bool:
     return bool(value and value.strip())
 
 
+def dedupe_preserve_order(values: list[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+
+    for value in values:
+        normalized = value.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+
+    return deduped
+
+
+def normalize_categories(categories: list[str], limit: int = 6) -> list[str]:
+    normalized_categories: list[str] = []
+    seen: set[str] = set()
+
+    for category in categories or []:
+        raw_parts = re.split(r"\s*/\s*|\s*>\s*|\s+\|\s+", category)
+        for part in raw_parts:
+            cleaned = re.sub(r"\s+", " ", part).strip(" -:/")
+            if not cleaned:
+                continue
+            normalized = normalize_text(cleaned)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            normalized_categories.append(cleaned)
+            if len(normalized_categories) >= limit:
+                return normalized_categories
+
+    return normalized_categories
+
+
+def clean_description(value: Optional[object], max_length: int = 900) -> str:
+    if not value:
+        return ""
+
+    if isinstance(value, dict):
+        value = value.get("value", "")
+    elif isinstance(value, list):
+        parts = [str(part).strip() for part in value if part]
+        value = " ".join(parts)
+
+    text = unescape(str(value))
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</p\s*>", "\n\n", text)
+    text = re.sub(r"(?i)<li\s*>", "- ", text)
+    text = re.sub(r"(?i)</li\s*>", "\n", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s*\n\s*", "\n", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = text.strip()
+
+    if len(text) <= max_length:
+        return text
+
+    cutoff = text.rfind(" ", 0, max_length)
+    if cutoff < max_length * 0.6:
+        cutoff = max_length
+    return text[:cutoff].rstrip(" ,;:-") + "..."
+
+
 async def fetch_google_books(query: str, max_results: int = 20) -> list[dict]:
     if not _google_books_available():
         raise GoogleBooksUnavailable("Google Books temporariamente indisponível")
@@ -143,8 +261,13 @@ async def fetch_google_books(query: str, max_results: int = 20) -> list[dict]:
     if cached is not None:
         return cached
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.get(GOOGLE_BOOKS_API, params=params)
+    try:
+        async with _PROVIDER_SEMAPHORE:
+            async with _build_async_client(timeout=10.0) as client:
+                response = await client.get(GOOGLE_BOOKS_API, params=params)
+    except httpx.ConnectError:
+        _mark_google_unavailable()
+        raise GoogleBooksUnavailable("Google Books temporariamente indisponivel por falha de conexao")
 
     if response.status_code in (403, 429):
         _mark_google_unavailable()
@@ -172,8 +295,13 @@ async def fetch_google_book_by_id(volume_id: str) -> Optional[dict]:
     if cached is not None:
         return cached
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.get(f"{GOOGLE_BOOKS_API}/{volume_id}", params=params)
+    try:
+        async with _PROVIDER_SEMAPHORE:
+            async with _build_async_client(timeout=10.0) as client:
+                response = await client.get(f"{GOOGLE_BOOKS_API}/{volume_id}", params=params)
+    except httpx.ConnectError:
+        _mark_google_unavailable()
+        raise GoogleBooksUnavailable("Google Books temporariamente indisponivel por falha de conexao")
 
     if response.status_code in (403, 429):
         _mark_google_unavailable()
@@ -195,22 +323,104 @@ async def fetch_open_library_search(params: dict) -> list[dict]:
         return cached
 
     headers = {"User-Agent": "BookRecomendations/0.1 (Open Library search)"}
-    async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
-        response = await client.get(OPEN_LIBRARY_SEARCH_API, params=params)
-        response.raise_for_status()
+    try:
+        async with _PROVIDER_SEMAPHORE:
+            async with _build_async_client(timeout=10.0, headers=headers) as client:
+                response = await client.get(OPEN_LIBRARY_SEARCH_API, params=params)
+                response.raise_for_status()
+    except httpx.ConnectError:
+        return []
 
     docs = response.json().get("docs", [])
     _cache_set(cache_key, docs)
     return docs
 
 
+async def probe_cover_url(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+
+    cache_key = _cache_key("cover_probe", {"url": url})
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached or None
+
+    try:
+        async with _COVER_SEMAPHORE:
+            async with _build_async_client(
+                timeout=COVER_FETCH_TIMEOUT_SECONDS,
+                follow_redirects=True,
+            ) as client:
+                response = await client.head(url)
+                content_type = response.headers.get("content-type", "")
+                if response.status_code >= 400 or not content_type.startswith("image/"):
+                    response = await client.get(url)
+                    content_type = response.headers.get("content-type", "")
+                if response.status_code >= 400 or not content_type.startswith("image/"):
+                    _cache_set(cache_key, "")
+                    return None
+    except httpx.HTTPError:
+        _cache_set(cache_key, "")
+        return None
+
+    _cache_set(cache_key, url)
+    return url
+
+
+async def fetch_google_cover_candidates(title: str, authors: list[str]) -> list[str]:
+    queries = []
+    cleaned_title = title.strip()
+    primary_author = authors[0].strip() if authors else ""
+
+    if cleaned_title and primary_author:
+        queries.append(f'intitle:"{cleaned_title}" inauthor:"{primary_author}"')
+        queries.append(f'{cleaned_title} {primary_author}')
+    if cleaned_title:
+        queries.append(f'intitle:"{cleaned_title}"')
+        queries.append(cleaned_title)
+    queries = dedupe_preserve_order(queries)
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    try:
+        batches = await asyncio.gather(
+            *[fetch_google_books(query, max_results=5) for query in queries],
+            return_exceptions=True,
+        )
+    except Exception:
+        return []
+
+    for batch in batches:
+        if isinstance(batch, Exception):
+            continue
+        for item in batch:
+            volume_info = item.get("volumeInfo", {})
+            item_title = normalize_text(volume_info.get("title"))
+            if cleaned_title and item_title and cleaned_title.casefold() not in item_title and item_title not in cleaned_title.casefold():
+                continue
+
+            item_authors = {normalize_text(author) for author in volume_info.get("authors", []) if author}
+            if primary_author:
+                normalized_author = normalize_text(primary_author)
+                if item_authors and normalized_author not in item_authors and not any(
+                    normalized_author in author or author in normalized_author for author in item_authors
+                ):
+                    continue
+
+            for candidate in _google_thumbnail_candidates(volume_info):
+                if candidate not in seen:
+                    seen.add(candidate)
+                    candidates.append(candidate)
+
+    return candidates
+
+
 def parse_open_library_doc(doc: dict) -> Optional[BookResponse]:
     try:
         cover_id = doc.get("cover_i")
-        thumbnail = upgrade_thumbnail_url(
-            f"https://covers.openlibrary.org/b/id/{cover_id}-L.jpg" if cover_id else None
-        )
-        subjects = doc.get("subject", []) or []
+        thumbnail = build_open_library_cover_url("id", str(cover_id)) if cover_id else None
+        subjects = normalize_categories(doc.get("subject", []) or [], limit=6)
         language = ""
         if isinstance(doc.get("language"), list) and doc["language"]:
             language = doc["language"][0]
@@ -219,15 +429,126 @@ def parse_open_library_doc(doc: dict) -> Optional[BookResponse]:
             id=doc.get("key", ""),
             title=doc.get("title", "Sem título"),
             authors=doc.get("author_name", []) or [],
-            categories=subjects[:6],
+            categories=subjects,
             page_count=doc.get("number_of_pages_median"),
             published_year=doc.get("first_publish_year"),
-            description="",
+            description=clean_description(doc.get("first_sentence")),
             thumbnail=thumbnail,
             language=language,
         )
     except Exception:
         return None
+
+
+def choose_cover_doc(
+    docs: list[dict],
+    title: str,
+    authors: list[str],
+    published_year: Optional[int],
+) -> Optional[dict]:
+    normalized_title = normalize_text(title)
+    normalized_authors = {normalize_text(author) for author in authors if author}
+    best_doc = None
+    best_score = -1.0
+
+    for doc in docs:
+        score = 0.0
+        doc_title = normalize_text(doc.get("title"))
+        if doc_title == normalized_title:
+            score += 3.0
+        elif normalized_title and normalized_title in doc_title:
+            score += 1.5
+
+        doc_authors = {normalize_text(author) for author in doc.get("author_name", []) if author}
+        if normalized_authors and doc_authors and normalized_authors & doc_authors:
+            score += 2.0
+
+        doc_year = doc.get("first_publish_year")
+        if published_year and isinstance(doc_year, int):
+            score += max(0.0, 1.0 - abs(published_year - doc_year) / 15)
+
+        if doc.get("cover_i"):
+            score += 1.5
+        if doc.get("isbn"):
+            score += 0.5
+
+        if score > best_score:
+            best_score = score
+            best_doc = doc
+
+    return best_doc
+
+
+async def resolve_thumbnail_fallback(book: BookResponse) -> Optional[str]:
+    lookup_cache_key = thumbnail_lookup_signature(book)
+    cached_thumbnail = _cache_get(lookup_cache_key)
+    if cached_thumbnail is not None:
+        return cached_thumbnail or None
+
+    candidate_urls: list[str] = []
+    seen: set[str] = set()
+    original_thumbnail = book.thumbnail
+
+    def add_candidate(url: Optional[str]) -> None:
+        upgraded = upgrade_thumbnail_url(url)
+        if upgraded and upgraded not in seen:
+            seen.add(upgraded)
+            candidate_urls.append(upgraded)
+
+    params = {
+        "title": book.title.strip(),
+        "limit": 5,
+        "fields": "key,title,author_name,first_publish_year,cover_i,isbn",
+    }
+    if book.authors:
+        params["author"] = book.authors[0]
+
+    try:
+        docs = await fetch_open_library_search(params)
+    except httpx.HTTPError:
+        docs = []
+
+    best_doc = choose_cover_doc(docs, book.title, book.authors, book.published_year)
+    if best_doc:
+        cover_id = best_doc.get("cover_i")
+        if cover_id:
+            add_candidate(build_open_library_cover_url("id", str(cover_id)))
+
+        for isbn in best_doc.get("isbn", []) or []:
+            add_candidate(build_open_library_cover_url("isbn", str(isbn)))
+
+    google_candidates = await fetch_google_cover_candidates(book.title, book.authors)
+    for candidate in google_candidates:
+        add_candidate(candidate)
+
+    add_candidate(original_thumbnail)
+
+    for candidate_url in candidate_urls:
+        thumbnail = await probe_cover_url(candidate_url)
+        if thumbnail:
+            _cache_set(lookup_cache_key, thumbnail)
+            return thumbnail
+
+    _cache_set(lookup_cache_key, "")
+    return None
+
+
+async def enrich_book_thumbnail(book: BookResponse) -> BookResponse:
+    if not book:
+        return book
+
+    fallback_thumbnail = await resolve_thumbnail_fallback(book)
+    if fallback_thumbnail:
+        book.thumbnail = fallback_thumbnail
+    return book
+
+
+async def enrich_books_thumbnails(books: list[BookResponse]) -> list[BookResponse]:
+    if not books:
+        return books
+
+    await asyncio.gather(*(enrich_book_thumbnail(book) for book in books if book))
+    return books
 
 
 async def fetch_open_library_books_by_author(
@@ -238,7 +559,7 @@ async def fetch_open_library_books_by_author(
     params = {
         "author": author.strip(),
         "limit": max_results,
-        "fields": "key,title,author_name,first_publish_year,cover_i,subject,language,number_of_pages_median",
+        "fields": "key,title,author_name,first_publish_year,cover_i,isbn,subject,language,number_of_pages_median",
     }
     if has_text(title):
         params["title"] = title.strip()
@@ -252,7 +573,7 @@ async def fetch_open_library_books_by_query(query: str, max_results: int = 20) -
     params = {
         "q": query.strip(),
         "limit": max_results,
-        "fields": "key,title,author_name,first_publish_year,cover_i,subject,language,number_of_pages_median",
+        "fields": "key,title,author_name,first_publish_year,cover_i,isbn,subject,language,number_of_pages_median",
     }
     docs = await fetch_open_library_search(params)
     books = [parse_open_library_doc(doc) for doc in docs]
@@ -263,14 +584,14 @@ async def fetch_open_library_book_by_id(book_id: str) -> Optional[BookResponse]:
     params = {
         "q": book_id.strip(),
         "limit": 10,
-        "fields": "key,title,author_name,first_publish_year,cover_i,subject,language,number_of_pages_median",
+        "fields": "key,title,author_name,first_publish_year,cover_i,isbn,subject,language,number_of_pages_median",
     }
     docs = await fetch_open_library_search(params)
     books = [parse_open_library_doc(doc) for doc in docs]
     normalized_id = normalize_text(book_id)
     for book in books:
         if book and normalize_text(book.id) == normalized_id:
-            return book
+            return await enrich_book_thumbnail(book)
     return None
 
 
@@ -283,7 +604,7 @@ async def fetch_open_library_books_by_subject(
     params = {
         "subject": subject.strip(),
         "limit": max_results,
-        "fields": "key,title,author_name,first_publish_year,cover_i,subject,language,number_of_pages_median",
+        "fields": "key,title,author_name,first_publish_year,cover_i,isbn,subject,language,number_of_pages_median",
     }
     if has_text(author):
         params["author"] = author.strip()
@@ -331,7 +652,7 @@ async def fetch_open_library_subjects(
         if cached is not None:
             return select_specific_subjects(cached.get("subjects", []))
 
-        async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
+        async with _build_async_client(timeout=10.0, headers=headers) as client:
             work_response = await client.get(f"https://openlibrary.org{work_key}.json")
             work_response.raise_for_status()
             work_data = work_response.json()
@@ -416,6 +737,18 @@ def normalize_book_signature(book: BookResponse) -> str:
     return f"{canonicalize_title(book.title)}::{author}"
 
 
+def thumbnail_lookup_signature(book: BookResponse) -> str:
+    return _cache_key(
+        "thumbnail_lookup_signature",
+        {
+            "title": canonicalize_title(book.title),
+            "author": normalize_text(book.authors[0]) if book.authors else "",
+            "year": book.published_year,
+            "language": normalize_text(book.language),
+        },
+    )
+
+
 async def resolve_reference_book(reference_id: str) -> Optional[BookResponse]:
     if not has_text(reference_id):
         return None
@@ -429,7 +762,8 @@ async def resolve_reference_book(reference_id: str) -> Optional[BookResponse]:
         item = None
 
     if item:
-        return parse_book(item)
+        book = parse_book(item)
+        return await enrich_book_thumbnail(book) if book else None
 
     return await fetch_open_library_book_by_id(reference_id)
 
@@ -650,6 +984,7 @@ async def search_books(
             queries.insert(0, f'intitle:"{q.strip()}" inauthor:"{author.strip()}"')
             queries.append(f'{q.strip()} inauthor:"{author.strip()}"')
         queries.append(q.strip())
+        queries = dedupe_preserve_order(queries)
 
         batches = await asyncio.gather(*[fetch_google_books(query, max_results=max_results) for query in queries])
         seen_ids: set[str] = set()
@@ -667,7 +1002,7 @@ async def search_books(
             reverse=True,
         )
         books = [parse_book(item) for item in ranked_items[:max_results]]
-        return [book for book in books if book is not None]
+        return await enrich_books_thumbnails([book for book in books if book is not None])
     except GoogleBooksUnavailable:
         query = f"{q.strip()} {author.strip()}" if has_text(author) else q.strip()
         books = await fetch_open_library_books_by_query(query, max_results=max_results)
@@ -675,7 +1010,7 @@ async def search_books(
             key=lambda book: _open_library_search_score(book, q.strip(), author),
             reverse=True,
         )
-        return books[:max_results]
+        return await enrich_books_thumbnails(books[:max_results])
 
 
 @app.get("/recommend", response_model=RecommendationResponse)
@@ -731,6 +1066,8 @@ async def recommend_books(
             detail="Não foi possível localizar uma obra de referência",
         )
 
+    reference = await enrich_book_thumbnail(reference)
+
     enriched_subjects = await fetch_open_library_subjects(
         reference.title,
         reference.authors,
@@ -766,8 +1103,9 @@ async def recommend_books(
     filtered = filter_books(candidates, filters)
     scored = score_books(filtered, reference)
     scored = [book for book in scored if book.score >= MIN_RECOMMENDATION_SCORE]
+    final_recommendations = await enrich_books_thumbnails(scored[:limit])
 
-    return RecommendationResponse(reference=reference, recommendations=scored[:limit])
+    return RecommendationResponse(reference=reference, recommendations=final_recommendations)
 
 
 def parse_book(item: dict) -> Optional[BookResponse]:
@@ -780,10 +1118,10 @@ def parse_book(item: dict) -> Optional[BookResponse]:
             id=item.get("id", ""),
             title=info.get("title", "Sem título"),
             authors=info.get("authors", []),
-            categories=info.get("categories", []),
+            categories=normalize_categories(info.get("categories", []), limit=6),
             page_count=info.get("pageCount"),
             published_year=year,
-            description=info.get("description", "")[:300] if info.get("description") else "",
+            description=clean_description(info.get("description")),
             thumbnail=upgrade_thumbnail_url(info.get("imageLinks", {}).get("thumbnail")),
             language=info.get("language", ""),
         )
@@ -881,7 +1219,8 @@ async def pick_best_reference(query: str) -> Optional[BookResponse]:
         return None
 
     ranked = sorted(all_items, key=lambda item: _reference_score(item, query), reverse=True)
-    return parse_book(ranked[0])
+    best_book = parse_book(ranked[0])
+    return await enrich_book_thumbnail(best_book) if best_book else None
 
 
 @app.get("/health")
