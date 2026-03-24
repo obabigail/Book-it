@@ -58,6 +58,7 @@ DECADE_OPTIONS = {
 PAGE_RANGE_MIN = 0
 PAGE_RANGE_MAX = 1500
 PAGE_RANGE_STEP = 100
+DEFAULT_RECOMMENDATION_LIMIT = 5
 
 
 def format_language_label(language_code: str | None) -> str:
@@ -127,7 +128,7 @@ def get_active_filter_labels(filters: dict) -> list[str]:
         labels.append(f"Década: {DECADE_OPTIONS.get(filters['decade'], filters['decade'])}")
     if filters.get("exclude_same_author"):
         labels.append("Sem obras do mesmo autor")
-    if filters.get("limit"):
+    if filters.get("limit") and filters["limit"] != DEFAULT_RECOMMENDATION_LIMIT:
         labels.append(f"{filters['limit']} recomendações")
     return labels
 
@@ -463,7 +464,7 @@ def get_recommendations(title: str, author: str, filters: dict, reference_id: st
     cleaned_filters = {
         key: value
         for key, value in filters.items()
-        if value is not None and value != ""
+        if value not in (None, "", False)
     }
     params = {
         "q": title.strip(),
@@ -627,7 +628,7 @@ def build_filters() -> dict:
                 "Quantidade de recomendações",
                 min_value=1,
                 max_value=20,
-                value=5,
+                value=DEFAULT_RECOMMENDATION_LIMIT,
                 step=1,
             )
 
@@ -666,17 +667,28 @@ def build_filters() -> dict:
     min_pages = page_range[0] if page_range[0] > PAGE_RANGE_MIN else None
     max_pages = page_range[1] if page_range[1] < PAGE_RANGE_MAX else None
 
-    return {
-        "min_pages": min_pages,
-        "max_pages": max_pages,
-        "min_year": min_year,
-        "max_year": max_year,
-        "decade": selected_decade or None,
-        "category": genre or None,
-        "language": selected_language or None,
-        "exclude_same_author": exclude_same_author,
-        "limit": int(limit),
-    }
+    filters: dict = {}
+
+    if min_pages is not None:
+        filters["min_pages"] = min_pages
+    if max_pages is not None:
+        filters["max_pages"] = max_pages
+    if min_year is not None:
+        filters["min_year"] = min_year
+    if max_year is not None:
+        filters["max_year"] = max_year
+    if selected_decade:
+        filters["decade"] = selected_decade
+    if genre:
+        filters["category"] = genre
+    if selected_language:
+        filters["language"] = selected_language
+    if exclude_same_author:
+        filters["exclude_same_author"] = True
+    if int(limit) != DEFAULT_RECOMMENDATION_LIMIT:
+        filters["limit"] = int(limit)
+
+    return filters
 
 
 def render_book_card(
